@@ -70,7 +70,7 @@ npx serve
 4. Your app will be available at:
 
    ```
-   https://yourusername.github.io/pakelmeet/
+   https://pakelcomedy.github.io/pakelmeet/
    ```
 
 ---
