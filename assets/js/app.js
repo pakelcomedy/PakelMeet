@@ -36,7 +36,6 @@ const firebaseConfig = {
   measurementId: "G-CHH9NJEB9J"
 };
 
-/* Initialize Firebase */
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const auth = getAuth(app);
@@ -98,7 +97,6 @@ const el = {
 };
 for (const k in el) if (!el[k]) console.debug('DOM missing:', k);
 
-/* create a small "show controls" button when auto-joined hides controls */
 function ensureShowControlsButton() {
   let b = $('#showControlsBtn');
   if (b) return b;
@@ -208,77 +206,92 @@ function updateParticipantsClass() {
 }
 
 /* ======================
-   7) Local media
+   7) Local media (improved front-camera heuristics)
    ====================== */
 async function ensureLocalStream(constraints = { audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } }) {
-  // If we already have a localStream, return it
   if (localState.localStream) return localState.localStream;
-
-  // Helper to normalize video constraints object
+  const audioWanted = !!(constraints && constraints.audio);
   const baseVideo = (constraints && typeof constraints.video === 'object') ? { ...constraints.video } : {};
 
-  // Try strategies in order:
-  // 1) exact facingMode: 'user' (may throw if device doesn't support exact)
-  // 2) ideal facingMode: 'user'
-  // 3) fallback to the provided constraints (or default)
-  const exactFront = { audio: !!constraints.audio, video: { ...baseVideo, facingMode: { exact: 'user' } } };
-  const idealFront = { audio: !!constraints.audio, video: { ...baseVideo, facingMode: { ideal: 'user' } } };
-  const fallback = { audio: !!constraints.audio, video: (Object.keys(baseVideo).length ? baseVideo : true) };
+  async function listVideoInputs() {
+    try { const devices = await navigator.mediaDevices.enumerateDevices(); return devices.filter(d => d.kind === 'videoinput'); } catch (e) { return []; }
+  }
+  function findFrontCandidate(devices) {
+    if (!devices || devices.length === 0) return null;
+    const labeled = devices.filter(d => d.label && d.label.trim().length > 0);
+    const re = /front|face|user|selfie|facetime|front camera|facing front|front-facing/i;
+    const byLabel = labeled.find(d => re.test(d.label));
+    if (byLabel) return byLabel;
+    if (labeled.length > 0) return labeled[0];
+    return devices[0] || null;
+  }
+  async function tryByDeviceId(deviceId) { if (!deviceId) return null; try { return await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: { deviceId: { exact: deviceId }, ...baseVideo } }); } catch (e) { return null; } }
+  async function tryByFacingMode(mode, useExact=false) { try { const fm = useExact ? { exact: mode } : { ideal: mode }; return await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: { ...baseVideo, facingMode: fm } }); } catch (e) { return null; } }
 
   let stream = null;
-  try {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia(exactFront);
-    } catch (errExact) {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia(idealFront);
-      } catch (errIdeal) {
-        // final fallback
-        stream = await navigator.mediaDevices.getUserMedia(fallback);
-      }
-    }
+  // 1) exact facingMode 'user'
+  stream = await tryByFacingMode('user', true);
+  if (!stream) stream = await tryByFacingMode('user', false);
 
-    // If we obtained a stream, but the active video track is not front-facing, try to explicitly select a front camera device
-    try {
+  // 2) try explicit deviceId only when labels are available (permission granted or previous stream)
+  try {
+    if (stream) {
       const vtracks = stream.getVideoTracks();
       if (vtracks && vtracks.length > 0) {
         const settings = vtracks[0].getSettings ? vtracks[0].getSettings() : {};
         const facing = settings.facingMode || '';
-        // If browser reports environment/rear, attempt to enumerate devices and pick a front camera
-        if (facing && facing.toLowerCase() !== 'user') {
-          // We have permission now (because we got stream), enumerate devices
-          const devices = await navigator.mediaDevices.enumerateDevices();
-          // find candidate videoinput whose label likely indicates front camera
-          const candidates = devices.filter(d => d.kind === 'videoinput' && d.deviceId);
-          // prefer labels containing 'front' / 'face' / 'user' / 'front camera' (case-insensitive)
-          const frontCandidate = candidates.find(d => /front|face|user|facetime|selfie/i.test(d.label));
-          if (frontCandidate && frontCandidate.deviceId) {
-            try {
-              const frontStream = await navigator.mediaDevices.getUserMedia({ audio: !!constraints.audio, video: { deviceId: { exact: frontCandidate.deviceId }, ...baseVideo } });
-              // stop old video tracks and replace
-              stream.getVideoTracks().forEach(t => { try { t.stop(); } catch(e){} });
-              stream = frontStream;
-            } catch (eReplace) {
-              console.warn('Failed to acquire explicit front camera deviceId, keeping original stream', eReplace);
-            }
-          }
+        if (String(facing).toLowerCase() === 'user') {
+          localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (front camera)'); return stream;
         }
       }
-    } catch (eDetect) { console.warn('Post-getUserMedia facing detection failed', eDetect); }
+    }
 
-    // Save and create preview tile
-    localState.localStream = stream;
-    createLocalTile(stream);
-    setStatus('Local media active');
-    return stream;
+    const devices = await listVideoInputs();
+    const hasLabels = devices.some(d => d.label && d.label.trim().length > 0);
+    if (hasLabels) {
+      const candidate = findFrontCandidate(devices);
+      if (candidate && candidate.deviceId) {
+        const byId = await tryByDeviceId(candidate.deviceId);
+        if (byId) {
+          if (stream) stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} });
+          localState.localStream = byId; createLocalTile(byId); setStatus('Local media active (front camera by deviceId)'); return byId;
+        }
+      }
+    }
+  } catch (e) { console.warn('Explicit front-device attempt failed', e); }
+
+  // 3) final fallback: generic getUserMedia
+  if (!stream) {
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: (Object.keys(baseVideo).length ? baseVideo : true) }); } catch (e) { console.error('getUserMedia fallback failed', e); throw e; }
+  }
+
+  // Final attempt to replace with front camera if labels available
+  try {
+    const vtracks = stream.getVideoTracks();
+    if (!vtracks || vtracks.length === 0) { localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (no video)'); return stream; }
+    const settings = vtracks[0].getSettings ? vtracks[0].getSettings() : {};
+    const facing = (settings && settings.facingMode) ? String(settings.facingMode).toLowerCase() : '';
+    if (facing === 'user') { localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (front camera)'); return stream; }
+
+    try {
+      const devices2 = await listVideoInputs(); const labeled2 = devices2.filter(d => d.label && d.label.trim().length > 0);
+      if (labeled2.length > 0) {
+        const candidate2 = findFrontCandidate(devices2);
+        if (candidate2 && candidate2.deviceId) {
+          const frontStream = await tryByDeviceId(candidate2.deviceId);
+          if (frontStream) { stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); localState.localStream = frontStream; createLocalTile(frontStream); setStatus('Local media active (front camera final)'); return frontStream; }
+        }
+      }
+    } catch (e) { console.warn('Final explicit device attempt failed', e); }
+
+    localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (best-effort)'); return stream;
   } catch (err) {
-    console.error('getUserMedia failed:', err);
-    setStatus('Failed to access camera/microphone — check permissions');
-    throw err;
+    console.error('Post-acquire processing failed', err);
+    localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (post-processing error)'); return stream;
   }
 }
 
-function setMicEnabled(enabled)(enabled) { if (!localState.localStream) return; localState.localStream.getAudioTracks().forEach(t => t.enabled = !!enabled); if (el.toggleMicBtn) { el.toggleMicBtn.setAttribute('aria-pressed', String(!enabled)); el.toggleMicBtn.textContent = enabled ? '🎙️ Mic' : '🔇 Mic'; } }
+function setMicEnabled(enabled) { if (!localState.localStream) return; localState.localStream.getAudioTracks().forEach(t => t.enabled = !!enabled); if (el.toggleMicBtn) { el.toggleMicBtn.setAttribute('aria-pressed', String(!enabled)); el.toggleMicBtn.textContent = enabled ? '🎙️ Mic' : '🔇 Mic'; } }
 function setCamEnabled(enabled) { if (!localState.localStream) return; localState.localStream.getVideoTracks().forEach(t => t.enabled = !!enabled); if (el.toggleCamBtn) { el.toggleCamBtn.setAttribute('aria-pressed', String(!enabled)); el.toggleCamBtn.textContent = enabled ? '🎥 Cam' : '🚫 Cam'; } const localTile = document.querySelector(`#tile-${localState.peerId}`); if (localTile) localTile.dataset._hasvideo = enabled ? 'true' : 'false'; }
 
 /* ======================
@@ -309,7 +322,6 @@ function makeNewPeerConnection(peerId, isOfferer=false) {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   const remoteStream = new MediaStream(); localState.remoteStreams.set(peerId, remoteStream);
 
-  // add local tracks
   if (localState.localStream) localState.localStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.localStream); } catch(e){} });
   if (localState.screenStream) localState.screenStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.screenStream); } catch(e){} });
 
@@ -322,7 +334,7 @@ function makeNewPeerConnection(peerId, isOfferer=false) {
 
   pc.addEventListener('icecandidate', async (evt) => { if (!evt.candidate) return; await sendSignal(localState.roomId, { type:'ice', from: localState.peerId, to: peerId, payload: evt.candidate.toJSON ? evt.candidate.toJSON() : evt.candidate }); });
 
-  pc.addEventListener('connectionstatechange', () => { console.log('pc state', peerId, pc.connectionState); if (pc.connectionState === 'failed') { /* let presence cleanup handle it */ } });
+  pc.addEventListener('connectionstatechange', () => { console.log('pc state', peerId, pc.connectionState); });
 
   localState.pcMap.set(peerId, pc);
   if (isOfferer) { try { const dc = pc.createDataChannel('p2p-chat'); setupDataChannelHandlers(peerId, dc); localState.dcMap.set(peerId, dc); } catch(e){ console.warn('createDataChannel error', e); } }
@@ -384,7 +396,6 @@ function startListeningToPeers(roomId) {
   const q = query(peersCollectionRef(roomId));
   const unsub = onSnapshot(q, (snapshot) => {
     const nowMs = Date.now();
-    // update meta map
     snapshot.docs.forEach(docSnap => {
       const data = docSnap.data(); const pid = data.peerId || docSnap.id;
       const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
@@ -442,20 +453,14 @@ function startListeningToMessages(roomId) {
 async function cleanupRoomIfEmpty(roomId) {
   if (!roomId) return;
   try {
-    // small delay to let Firestore settle (best-effort)
     await new Promise(res => setTimeout(res, 200));
     const peersSnap = await getDocs(peersCollectionRef(roomId));
     if (!peersSnap || peersSnap.empty) {
       setStatus(`Cleaning up empty room ${roomId}`);
       const deletions = [];
-      const signalsSnap = await getDocs(signalsCollectionRef(roomId));
-      signalsSnap.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'signals', d.id)).catch(()=>{})));
-      const msgsSnap = await getDocs(messagesCollectionRef(roomId));
-      msgsSnap.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'messages', d.id)).catch(()=>{})));
-      // remove any leftover peers docs
-      const peersSnap2 = await getDocs(peersCollectionRef(roomId));
-      peersSnap2.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'peers', d.id)).catch(()=>{})));
-      // try removing room doc too
+      try { const signalsSnap = await getDocs(signalsCollectionRef(roomId)); signalsSnap.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'signals', d.id)).catch(()=>{}))); } catch(e){}
+      try { const msgsSnap = await getDocs(messagesCollectionRef(roomId)); msgsSnap.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'messages', d.id)).catch(()=>{}))); } catch(e){}
+      try { const peersSnap2 = await getDocs(peersCollectionRef(roomId)); peersSnap2.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'peers', d.id)).catch(()=>{}))); } catch(e){}
       deletions.push(deleteDoc(roomDocRef(roomId)).catch(()=>{}));
       await Promise.all(deletions);
       console.log('Room cleanup complete', roomId);
@@ -470,16 +475,14 @@ async function cleanupRoomIfEmpty(roomId) {
    ====================== */
 async function pickAutoDisplayName(roomId) {
   try {
-    // Count active peers (within presence timeout)
     const snap = await getDocs(peersCollectionRef(roomId));
     let active = 0;
     snap.forEach(docSnap => {
       const d = docSnap.data(); const lastSeenMs = (d.lastSeen && d.lastSeen.toMillis) ? d.lastSeen.toMillis() : (d.lastSeen || 0);
       if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) active++;
     });
-    // produce Participant N where N = active + 1
     return `Participant ${active + 1}`;
-  } catch (e) { console.warn('pickAutoDisplayName failed', e); return `Participant` + Math.floor(Math.random()*1000); }
+  } catch (e) { console.warn('pickAutoDisplayName failed', e); return `Participant${Math.floor(Math.random()*1000)}`; }
 }
 
 async function joinRoom(roomIdInput) {
@@ -490,24 +493,18 @@ async function joinRoom(roomIdInput) {
   localState.roomId = roomId; localState.peerId = genId('p-');
   const dn = el.displayNameInput && el.displayNameInput.value;
   if (dn && dn.trim()) localState.displayName = dn.trim();
-  else {
-    // auto-pick display name if none provided
-    try { const auto = await pickAutoDisplayName(roomId); localState.displayName = auto; if (el.displayNameInput) el.displayNameInput.value = auto; } catch(e) { console.warn(e); }
-  }
+  else { try { const auto = await pickAutoDisplayName(roomId); localState.displayName = auto; if (el.displayNameInput) el.displayNameInput.value = auto; } catch(e) { console.warn(e); } }
 
   setStatus(`Joining ${roomId} as ${localState.peerId} (${localState.displayName})`);
 
-  // share URL
   try { const href = new URL(window.location.href); href.hash = roomId; if (el.shareUrl) el.shareUrl.textContent = href.toString(); } catch(e){ if (el.shareUrl) el.shareUrl.textContent = `${window.location.href}#${roomId}`; }
 
-  // get local media, but don't block join if user denies
   try { await ensureLocalStream(); } catch(e) { console.warn('No local media available.'); }
 
   try { await writePeerPresence(roomId, localState.peerId, { name: localState.displayName }); } catch(e) { console.error('Failed to write presence', e); setStatus('Failed to join (Firestore error)'); return; }
 
   startListeningToPeers(roomId); startListeningToSignals(roomId); startListeningToMessages(roomId);
 
-  // proactively offer to existing peers
   try {
     const peersSnap = await getDocs(peersCollectionRef(roomId));
     peersSnap.forEach(docSnap => {
@@ -531,32 +528,23 @@ async function joinRoom(roomIdInput) {
 
 async function leaveRoom() {
   if (!localState._joined) { setStatus('Not in a room'); return; }
-  const roomId = localState.roomId;
-  setStatus('Leaving room...');
-
-  // close PCs
+  const roomId = localState.roomId; setStatus('Leaving room...');
   for (const [peerId, pc] of localState.pcMap.entries()) { try { pc.close(); } catch(e){} }
   localState.pcMap.clear(); localState.dcMap.clear();
-
   stopPresenceHeartbeat(); stopVideoStatePolling();
 
   if (roomId && localState.peerId) {
     try { await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online:false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge:true }); } catch(e) { console.warn('mark offline failed', e); }
     try { await removePeerPresence(roomId, localState.peerId); } catch(e) { console.warn('remove presence failed', e); }
-    // best-effort: if we removed the last peer, clean signals/messages/room
     try { await cleanupRoomIfEmpty(roomId); } catch(e) { console.warn('cleanup attempt failed', e); }
   }
 
   localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e){} }); localState.unsubscribers = [];
-
-  // remove tiles
   if (el.videos) { const tiles = Array.from(el.videos.querySelectorAll('.vid')); tiles.forEach(t => t.remove()); }
-
   if (localState.localStream) { localState.localStream.getTracks().forEach(t => t.stop()); localState.localStream = null; }
   if (localState.screenStream) { localState.screenStream.getTracks().forEach(t => t.stop()); localState.screenStream = null; }
 
   localState.roomId = null; localState.peerId = null; localState.remoteStreams.clear(); localState.peerMeta.clear(); localState._joined = false;
-
   if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = true; if (el.createRoomBtn) el.createRoomBtn.disabled = false;
   setStatus('Left room');
 
@@ -574,7 +562,6 @@ async function tryCleanupOnUnload() {
     if (localState.roomId && localState.peerId) {
       try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online:false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge:true }); } catch(e) { console.warn('presence set failed on unload', e); }
       try { await removePeerPresence(localState.roomId, localState.peerId); } catch(e) { console.warn('removePeerPresence failed on unload', e); }
-      // attempt cleanup when leaving
       try { await cleanupRoomIfEmpty(localState.roomId); } catch(e) { console.warn('cleanup on unload failed', e); }
     }
   } catch (err) { console.warn('tryCleanupOnUnload error', err); }
@@ -582,8 +569,11 @@ async function tryCleanupOnUnload() {
   if (localState.screenStream) localState.screenStream.getTracks().forEach(t => t.stop());
 }
 
-window.addEventListener('beforeunload', () => { tryCleanupOnUnload(); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') tryCleanupOnUnload(); });
+// cleanup only on actual unload/navigation (avoid running on tab switch/visibility change)
+window.addEventListener('beforeunload', (ev) => { tryCleanupOnUnload(); });
+// pagehide handles mobile and bfcache -- only cleanup when not persisted
+window.addEventListener('pagehide', (ev) => { if (!ev.persisted) tryCleanupOnUnload(); });
+// DO NOT run cleanup on visibilitychange — switching tabs should NOT trigger leave/cleanup
 
 /* ======================
    13) Presence heartbeat
