@@ -1,4 +1,4 @@
-# PakelMeet
+# PakelMeet [DEMO]
 
 **PakelMeet** is a lightweight, browser-based video meeting application designed for small groups (3–4 participants).  
 It uses **WebRTC** for peer-to-peer audio/video communication and **Firebase Firestore** (or any signaling backend) for room signaling.  
@@ -70,7 +70,7 @@ npx serve
 4. Your app will be available at:
 
    ```
-   https://yourusername.github.io/pakelmeet/
+   https://pakelcomedy.github.io/pakelmeet/
    ```
 
 ---
