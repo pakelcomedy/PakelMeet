@@ -1,14 +1,14 @@
 /* ==========================================================
-  PakelMeet — assets/js/app.js (FIXED & PRODUCTION-READY)
-  - Full WebRTC mesh with Firestore signaling & chat
-  - Presence heartbeat + best-effort unload cleanup
-  - Auto-join from URL hash (hides room controls when auto-joined)
-  - Visibility rules: show at most N tiles (default 4)
-  - Auto-assign display names: "Participant 1", "Participant 2", ...
-  - Auto-clean Firestore room data when last user leaves (best-effort)
+  PakelMeet — assets/js/app.js (FIXED & PRODUCTION-READY v2)
+  - Major fixes to guarantee local camera preview shows reliably on first join
+  - Robust front-camera selection on mobile
+  - Replace/add tracks instead of duplicating
+  - Ensure video.play() is attempted and metadata handled
+  - Proper cleanup and best-effort room cleanup when last peer leaves
+  - Auto nickname, auto-join from hash, visibility rules maintained
 
   Usage: <script type="module" src="/assets/js/app.js" defer></script>
-  NOTE: Replace firebaseConfig with your own project credentials if desired.
+  NOTE: Replace firebaseConfig with your Firebase credentials if desired.
   ========================================================== */
 
 /* ======================
@@ -136,23 +136,59 @@ function hasActiveVideoFromStream(stream) {
 }
 
 /* ======================
-   6) Video tile helpers
+   6) Video tile helpers (robust)
    ====================== */
+function removeLocalTileIfExists() {
+  try {
+    const existing = document.querySelector('.vid.local');
+    if (existing) existing.remove();
+  } catch(e){}
+}
+
+async function ensureVideoPlays(videoEl) {
+  // try to play; some mobile browsers require user gesture — handle gracefully
+  try {
+    if (typeof videoEl.play === 'function') {
+      await videoEl.play();
+    }
+  } catch(e) {
+    // ignore — autoplay policy may prevent play; element will start once permitted
+    console.debug('video.play() failed (autoplay policy)', e);
+  }
+}
+
 function createLocalTile(stream) {
+  // remove any old local tile (previews) to avoid duplicates
+  removeLocalTileIfExists();
+
   const tpl = document.querySelector('#video-tile-template');
   const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : safeCreateElem('div', { class: 'vid' });
   container.dataset.peer = localState.peerId || 'local';
   container.classList.add('vid','local');
   container.id = `tile-${localState.peerId || 'local'}`;
+
   const videoEl = container.querySelector('video') || safeCreateElem('video');
-  videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true;
+  videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true; // local muted to allow autoplay
   try { videoEl.srcObject = stream; } catch(e){ console.warn('Failed set srcObject local', e); }
   if (!container.contains(videoEl)) container.appendChild(videoEl);
+
   const nameEl = container.querySelector('[data-hook="video-name"]') || safeCreateElem('div', { class: 'name' });
   nameEl.textContent = localState.displayName || 'Me';
   if (!container.contains(nameEl)) container.appendChild(nameEl);
+
   container.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
   if (el.videos) el.videos.prepend(container);
+
+  // attempt to play (best-effort) and listen for metadata
+  const tryPlay = async () => {
+    try {
+      await ensureVideoPlays(videoEl);
+      // if still not showing, re-trigger layout after a tick
+      setTimeout(() => { try { videoEl.play && videoEl.play().catch(()=>{}); } catch(e){} updateParticipantsClass(); }, 160);
+    } catch(e){ console.warn('ensureVideoPlays failed', e); }
+  };
+  if (videoEl.readyState >= 2) tryPlay(); else { videoEl.addEventListener('loadedmetadata', tryPlay, { once:true }); }
+
   updateParticipantsClass();
   return container;
 }
@@ -206,10 +242,18 @@ function updateParticipantsClass() {
 }
 
 /* ======================
-   7) Local media (improved front-camera heuristics)
+   7) Local media (improved & robust)
    ====================== */
 async function ensureLocalStream(constraints = { audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } }) {
-  if (localState.localStream) return localState.localStream;
+  // If we already have a localStream that's active, return it
+  try {
+    if (localState.localStream) {
+      const vtracks = localState.localStream.getVideoTracks();
+      if (vtracks && vtracks.length > 0 && vtracks.some(t => !t.readyState || t.readyState !== 'ended')) return localState.localStream;
+      // if tracks ended, fall through to re-acquire
+    }
+  } catch(e) { console.warn('localStream check failed', e); }
+
   const audioWanted = !!(constraints && constraints.audio);
   const baseVideo = (constraints && typeof constraints.video === 'object') ? { ...constraints.video } : {};
 
@@ -225,15 +269,16 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
     if (labeled.length > 0) return labeled[0];
     return devices[0] || null;
   }
+
   async function tryByDeviceId(deviceId) { if (!deviceId) return null; try { return await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: { deviceId: { exact: deviceId }, ...baseVideo } }); } catch (e) { return null; } }
   async function tryByFacingMode(mode, useExact=false) { try { const fm = useExact ? { exact: mode } : { ideal: mode }; return await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: { ...baseVideo, facingMode: fm } }); } catch (e) { return null; } }
 
   let stream = null;
-  // 1) exact facingMode 'user'
+  // 1) try facingMode exact
   stream = await tryByFacingMode('user', true);
   if (!stream) stream = await tryByFacingMode('user', false);
 
-  // 2) try explicit deviceId only when labels are available (permission granted or previous stream)
+  // 2) if we have stream and it's front-facing according to settings, accept
   try {
     if (stream) {
       const vtracks = stream.getVideoTracks();
@@ -246,6 +291,7 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
       }
     }
 
+    // 3) enumerate devices and try to pick a front-labeled device if labels available
     const devices = await listVideoInputs();
     const hasLabels = devices.some(d => d.label && d.label.trim().length > 0);
     if (hasLabels) {
@@ -260,12 +306,12 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
     }
   } catch (e) { console.warn('Explicit front-device attempt failed', e); }
 
-  // 3) final fallback: generic getUserMedia
+  // 4) fallback: generic getUserMedia
   if (!stream) {
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: (Object.keys(baseVideo).length ? baseVideo : true) }); } catch (e) { console.error('getUserMedia fallback failed', e); throw e; }
   }
 
-  // Final attempt to replace with front camera if labels available
+  // 5) final try to replace with front camera if possible
   try {
     const vtracks = stream.getVideoTracks();
     if (!vtracks || vtracks.length === 0) { localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (no video)'); return stream; }
@@ -315,15 +361,30 @@ async function sendSignal(roomId, message){ try { await addDoc(signalsCollection
 async function sendChatMessage(roomId, name, text){ if (!text || !text.trim()) return; try { await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null }); } catch(e){ console.error('sendChatMessage failed', e); } }
 
 /* ======================
-   9) Peer connection helpers
+   9) Peer connection helpers (replace tracks instead of duping)
    ====================== */
+function replaceOrAddTrack(pc, track, stream) {
+  try {
+    const kind = track.kind;
+    const senders = pc.getSenders ? pc.getSenders() : [];
+    const sender = senders.find(s => s.track && s.track.kind === kind);
+    if (sender && typeof sender.replaceTrack === 'function') {
+      sender.replaceTrack(track);
+      return sender;
+    } else {
+      return pc.addTrack(track, stream);
+    }
+  } catch (e) { try { return pc.addTrack(track, stream); } catch(er) { console.warn('replaceOrAddTrack failed', er); } }
+}
+
 function makeNewPeerConnection(peerId, isOfferer=false) {
   if (localState.pcMap.has(peerId)) return localState.pcMap.get(peerId);
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   const remoteStream = new MediaStream(); localState.remoteStreams.set(peerId, remoteStream);
 
-  if (localState.localStream) localState.localStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.localStream); } catch(e){} });
-  if (localState.screenStream) localState.screenStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.screenStream); } catch(e){} });
+  // add local tracks (replace if already added)
+  if (localState.localStream) localState.localStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.localStream); } catch(e){} });
+  if (localState.screenStream) localState.screenStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.screenStream); } catch(e){} });
 
   pc.addEventListener('track', (evt) => {
     if (evt.streams && evt.streams[0]) { localState.remoteStreams.set(peerId, evt.streams[0]); setRemoteStreamOnTile(peerId, evt.streams[0]); }
@@ -499,6 +560,7 @@ async function joinRoom(roomIdInput) {
 
   try { const href = new URL(window.location.href); href.hash = roomId; if (el.shareUrl) el.shareUrl.textContent = href.toString(); } catch(e){ if (el.shareUrl) el.shareUrl.textContent = `${window.location.href}#${roomId}`; }
 
+  // get local media, but don't block join if user denies (we still join)
   try { await ensureLocalStream(); } catch(e) { console.warn('No local media available.'); }
 
   try { await writePeerPresence(roomId, localState.peerId, { name: localState.displayName }); } catch(e) { console.error('Failed to write presence', e); setStatus('Failed to join (Firestore error)'); return; }
@@ -555,7 +617,7 @@ async function leaveRoom() {
   updateParticipantsClass();
 }
 
-/* best-effort cleanup on unload */
+/* best-effort cleanup on unload (only on actual unload/navigation) */
 async function tryCleanupOnUnload() {
   stopVideoStatePolling(); stopPresenceHeartbeat();
   try {
@@ -569,11 +631,8 @@ async function tryCleanupOnUnload() {
   if (localState.screenStream) localState.screenStream.getTracks().forEach(t => t.stop());
 }
 
-// cleanup only on actual unload/navigation (avoid running on tab switch/visibility change)
 window.addEventListener('beforeunload', (ev) => { tryCleanupOnUnload(); });
-// pagehide handles mobile and bfcache -- only cleanup when not persisted
 window.addEventListener('pagehide', (ev) => { if (!ev.persisted) tryCleanupOnUnload(); });
-// DO NOT run cleanup on visibilitychange — switching tabs should NOT trigger leave/cleanup
 
 /* ======================
    13) Presence heartbeat
