@@ -1,43 +1,25 @@
 /* =========================================================================
-   PakelMeet — assets/js/app.js
-   - WebRTC mesh (3-4 peers) with Firestore signaling & chat
-   - Features:
-     * Create / Join room (roomId)
-     * Firestore collections:
-         rooms/{roomId}/peers/{peerId}  -> peer presence/metadata
-         rooms/{roomId}/signals         -> offer/answer/ice messages
-         rooms/{roomId}/messages        -> chat messages
-     * Local media (mic/cam), screen share
-     * DataChannel for optional peer-to-peer features (not required for chat)
-     * Robust cleanup on leave/unload
-   - Requirements: Provide your Firebase config below. Enable Firestore + Auth (anonymous recommended).
-   - Notes: This implementation favors clarity and robustness over maximal brevity.
+   PakelMeet — assets/js/app.js (LATEST)
+   - Full WebRTC mesh with Firestore signaling & chat
+   - Automatically hides extra participants when >4 shown (prioritize cam-on)
+   - Polls video-track state to react to camera toggles
+   - Includes layout helpers to fit tiles to viewport
    ========================================================================= */
 
 /* ======================
    1) Firebase imports (ES modules)
-   * Using Firebase modular v9+ style via CDN imports (works in browser)
-   * If you prefer bundler + npm, change imports accordingly.
    ====================== */
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-app.js';
 import {
   getFirestore, collection, doc, setDoc, addDoc, deleteDoc, getDocs,
-  onSnapshot, query, orderBy, serverTimestamp, where
+  onSnapshot, query, orderBy, serverTimestamp
 } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore.js';
 import {
   getAuth, signInAnonymously, onAuthStateChanged
 } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-auth.js';
 
 /* ======================
-   2) FIREBASE CONFIG - FILL THIS with your project values
-   Go to Firebase Console → Project settings → Add web app → copy config
-   Example:
-   const firebaseConfig = {
-     apiKey: "...",
-     authDomain: "project-id.firebaseapp.com",
-     projectId: "project-id",
-     appId: "1:123:web:abc"
-   };
+   2) FIREBASE CONFIG (already provided)
    ====================== */
 const firebaseConfig = {
   apiKey: "AIzaSyD4sr-HM_KbDf9gJ-o4N8vywUqRERTPeVY",
@@ -49,96 +31,65 @@ const firebaseConfig = {
   measurementId: "G-CHH9NJEB9J"
 };
 
-if (!firebaseConfig || !firebaseConfig.apiKey) {
-  console.warn("Firebase config is empty. Please fill firebaseConfig in assets/js/app.js");
-}
-
-/* ======================
-   3) Initialize Firebase & services
-   ====================== */
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const auth = getAuth(app);
 
-/* anonymous sign-in so Firestore rules that require auth work */
+/* anonymous sign-in */
 let currentUser = null;
-signInAnonymously(auth)
-  .catch(err => {
-    console.error("Firebase anon sign-in failed:", err);
-    // continue without auth but Firestore rules might block actions
-  });
-
-onAuthStateChanged(auth, user => {
-  currentUser = user;
-  console.log("Auth state:", user ? "signed in (anon)" : "signed out");
-});
+signInAnonymously(auth).catch(err => console.error("Firebase anon sign-in failed:", err));
+onAuthStateChanged(auth, user => { currentUser = user; console.log("Auth:", user ? "anon" : "signed out"); });
 
 /* ======================
-   4) App state / structures
+   3) App state
    ====================== */
-const ICE_SERVERS = [
-  { urls: "stun:stun.l.google.com:19302" },
-  // If you have TURN, add here. Example:
-  // { urls: 'turn:turn.example.com:3478', username: 'user', credential: 'pass' }
-];
+const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
 const localState = {
   roomId: null,
   peerId: null,
   displayName: "Guest",
-  pcMap: new Map(),        // peerId -> RTCPeerConnection
-  dcMap: new Map(),        // peerId -> DataChannel (for p2p messages if needed)
-  remoteStreams: new Map(),// peerId -> MediaStream
+  pcMap: new Map(),
+  dcMap: new Map(),
+  remoteStreams: new Map(),
   localStream: null,
   screenStream: null,
-  unsubscribers: [],       // list of Firestore snapshot unsubscribe functions
-  listeners: {},           // custom event listeners if needed
+  unsubscribers: [],
+  listeners: {},
+  peerMeta: new Map(),            // peerId -> { name, createdAtMs }
+  _videoDetectInterval: null,     // polling interval id
 };
 
 /* ======================
-   5) DOM ELEMENTS (match your index.html IDs/classes)
+   4) DOM helpers
    ====================== */
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
-
 const el = {
   roomForm: $('#roomForm'),
   roomIdInput: $('#roomId'),
   createRoomBtn: $('#createRoom'),
   leaveRoomBtn: $('#leaveRoom'),
   shareUrl: $('#shareUrl'),
-
   videos: $('#videos'),
   displayNameInput: $('#displayName'),
   toggleMicBtn: $('#toggleMic'),
   toggleCamBtn: $('#toggleCam'),
   shareScreenBtn: $('#shareScreen'),
-
   chatBox: $('#chatBox'),
   chatForm: $('#chatForm'),
   chatInput: $('#chatInput'),
   sendChatBtn: $('#sendChat'),
-
   status: $('#status'),
 };
-
-/* Small safety: ensure required elements exist */
-for (const k in el) {
-  if (!el[k]) console.warn(`Missing DOM element: ${k}`);
-}
+for (const k in el) if (!el[k]) console.warn(`Missing DOM element: ${k}`);
 
 /* ======================
-   6) Utilities
+   5) Utilities
    ====================== */
-const genId = (prefix = '') =>
-  prefix + Math.random().toString(36).slice(2, 9);
-
-const setStatus = (msg) => {
-  if (el.status) el.status.textContent = msg;
-  console.log(`[status] ${msg}`);
-};
-
-const safeCreateElem = (tag, attrs = {}) => {
+const genId = (pref='') => pref + Math.random().toString(36).slice(2,9);
+const setStatus = (msg) => { if (el.status) el.status.textContent = msg; console.log('[status]', msg); };
+const safeCreateElem = (tag, attrs={}) => {
   const e = document.createElement(tag);
   for (const k in attrs) {
     if (k === 'class') e.className = attrs[k];
@@ -147,38 +98,39 @@ const safeCreateElem = (tag, attrs = {}) => {
   }
   return e;
 };
-
-const appendLogToChat = (meta = { name:'', text:'', ts:Date.now(), self:false }) => {
+const appendLogToChat = (m={name:'', text:'', ts:Date.now(), self:false}) => {
   if (!el.chatBox) return;
   const wrap = safeCreateElem('div', { class: 'msg' });
-  const nameEl = safeCreateElem('div', { class: 'meta', text: `${meta.name} · ${new Date(meta.ts).toLocaleTimeString()}` });
-  const textEl = safeCreateElem('div', { class: 'text', text: meta.text });
-  if (meta.self) textEl.style.fontWeight = '600';
-  wrap.appendChild(nameEl);
-  wrap.appendChild(textEl);
+  const meta = safeCreateElem('div', { class: 'meta', text: `${m.name} · ${new Date(m.ts).toLocaleTimeString()}` });
+  const text = safeCreateElem('div', { class: 'text', text: m.text });
+  if (m.self) text.style.fontWeight = '600';
+  wrap.appendChild(meta); wrap.appendChild(text);
   el.chatBox.appendChild(wrap);
-  // auto-scroll
   el.chatBox.scrollTop = el.chatBox.scrollHeight;
 };
 
+/* helper to detect if a MediaStream has an enabled video track */
+function hasActiveVideoFromStream(stream) {
+  try {
+    if (!stream) return false;
+    const tracks = stream.getVideoTracks ? stream.getVideoTracks() : [];
+    return tracks.some(t => t && t.enabled !== false);
+  } catch (e) { return false; }
+}
+
 /* ======================
-   7) UI helpers (video tiles)
-   - createLocalTile()
-   - addRemoteTile(peerId)
-   - removeTile(peerId)
-   - updateParticipantsClass()
+   6) UI helpers: tiles
    ====================== */
 
 function createLocalTile(stream) {
-  // create tile with muted local video (preview)
   const tpl = document.querySelector('#video-tile-template');
-  const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : document.createElement('div');
+  const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : safeCreateElem('div', { class: 'vid' });
   container.dataset.peer = localState.peerId || 'local';
-  container.classList.add('vid', 'local');
+  container.classList.add('vid','local');
+  container.id = `tile-${localState.peerId || 'local'}`;
+
   const videoEl = container.querySelector('video') || safeCreateElem('video');
-  videoEl.autoplay = true;
-  videoEl.playsInline = true;
-  videoEl.muted = true; // local preview muted
+  videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true;
   videoEl.srcObject = stream;
   if (!container.contains(videoEl)) container.appendChild(videoEl);
 
@@ -186,59 +138,58 @@ function createLocalTile(stream) {
   nameEl.textContent = localState.displayName || 'Me';
   if (!container.contains(nameEl)) container.appendChild(nameEl);
 
-  container.id = `tile-${localState.peerId || 'local'}`;
+  // mark initial video presence flag
+  container.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
 
-  // Prepend local tile to emphasize it
   el.videos.prepend(container);
   updateParticipantsClass();
   return container;
 }
 
-function addRemoteTile(peerId, name = 'Participant') {
-  // Avoid duplicates
+function addRemoteTile(peerId, name='Participant') {
   if (document.querySelector(`#tile-${peerId}`)) return document.querySelector(`#tile-${peerId}`);
-
   const tpl = document.querySelector('#video-tile-template');
   const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : safeCreateElem('div', { class: 'vid' });
   container.dataset.peer = peerId;
   container.id = `tile-${peerId}`;
 
   const videoEl = container.querySelector('video') || safeCreateElem('video');
-  videoEl.autoplay = true;
-  videoEl.playsInline = true;
-  videoEl.muted = false;
+  videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = false;
   if (!container.contains(videoEl)) container.appendChild(videoEl);
 
   const nameEl = container.querySelector('[data-hook="video-name"]') || safeCreateElem('div', { class: 'name' });
   nameEl.textContent = name || 'Participant';
   if (!container.contains(nameEl)) container.appendChild(nameEl);
 
+  container.dataset._hasvideo = 'false'; // will be updated when stream arrives
   el.videos.appendChild(container);
   updateParticipantsClass();
   return container;
 }
 
 function setRemoteStreamOnTile(peerId, stream) {
-  const tile = document.querySelector(`#tile-${peerId}`);
-  if (!tile) {
-    // If tile doesn't exist yet, create it using unknown name
-    addRemoteTile(peerId, 'Participant');
-  }
-  const videoEl = document.querySelector(`#tile-${peerId} video`);
+  let tile = document.querySelector(`#tile-${peerId}`);
+  if (!tile) tile = addRemoteTile(peerId, localState.peerMeta.get(peerId)?.name || 'Participant');
+  const videoEl = tile.querySelector('video');
   if (videoEl) {
     videoEl.srcObject = stream;
+    // mark dataset for polling logic
+    tile.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
   }
+  localState.remoteStreams.set(peerId, stream);
   updateParticipantsClass();
 }
 
 function removeTile(peerId) {
-  const tile = document.querySelector(`#tile-${peerId}`);
-  if (tile) tile.remove();
+  const t = document.querySelector(`#tile-${peerId}`);
+  if (t) t.remove();
+  localState.peerMeta.delete(peerId);
+  localState.remoteStreams.delete(peerId);
   updateParticipantsClass();
 }
 
+/* Update participants class counts and then enforce visibility/layout */
 function updateParticipantsClass() {
-  // count of tiles excluding local preview optional - include local for layout
   const tiles = el.videos ? el.videos.querySelectorAll('.vid') : [];
   const count = tiles ? tiles.length : 0;
   const container = el.videos;
@@ -246,19 +197,26 @@ function updateParticipantsClass() {
   container.classList.remove(...Array.from(container.classList).filter(c => c.startsWith('participants-')));
   const capped = Math.min(Math.max(count, 1), 9);
   container.classList.add(`participants-${capped}`);
+
+  // Enforce visibility rules (max 4 visible)
+  applyVisibilityRules(4);
+
+  // Recalculate layout / fit to viewport
+  if (typeof layoutVideoGrid === 'function') layoutVideoGrid();
+  if (typeof fitVideosToViewport === 'function') fitVideosToViewport();
 }
 
 /* ======================
-   8) Local media (getUserMedia) with graceful fallback
+   7) Local media
    ====================== */
 async function ensureLocalStream(constraints = { audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } }) {
   if (localState.localStream) return localState.localStream;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    localState.localStream = stream;
-    createLocalTile(stream);
+    const s = await navigator.mediaDevices.getUserMedia(constraints);
+    localState.localStream = s;
+    createLocalTile(s);
     setStatus('Local media active');
-    return stream;
+    return s;
   } catch (err) {
     console.error("getUserMedia failed:", err);
     setStatus('Gagal mengambil media — cek izin kamera/mikrofon');
@@ -266,38 +224,36 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
   }
 }
 
-/* Toggle mic/cam helpers */
+/* Toggle helpers */
 function setMicEnabled(enabled) {
   if (!localState.localStream) return;
   localState.localStream.getAudioTracks().forEach(t => t.enabled = !!enabled);
-  el.toggleMicBtn && el.toggleMicBtn.setAttribute('aria-pressed', String(!enabled ? 'true' : 'false'));
-  el.toggleMicBtn && (el.toggleMicBtn.textContent = enabled ? '🎙️ Mic' : '🔇 Mic');
+  if (el.toggleMicBtn) {
+    el.toggleMicBtn.setAttribute('aria-pressed', String(!enabled));
+    el.toggleMicBtn.textContent = enabled ? '🎙️ Mic' : '🔇 Mic';
+  }
 }
 function setCamEnabled(enabled) {
   if (!localState.localStream) return;
   localState.localStream.getVideoTracks().forEach(t => t.enabled = !!enabled);
-  el.toggleCamBtn && el.toggleCamBtn.setAttribute('aria-pressed', String(!enabled ? 'true' : 'false'));
-  el.toggleCamBtn && (el.toggleCamBtn.textContent = enabled ? '🎥 Cam' : '🚫 Cam');
+  if (el.toggleCamBtn) {
+    el.toggleCamBtn.setAttribute('aria-pressed', String(!enabled));
+    el.toggleCamBtn.textContent = enabled ? '🎥 Cam' : '🚫 Cam';
+  }
+  // update our local tile flag immediately
+  const localTile = document.querySelector(`#tile-${localState.peerId}`);
+  if (localTile) localTile.dataset._hasvideo = enabled ? 'true' : 'false';
 }
 
 /* ======================
-   9) Firestore helpers: collections & convenience wrappers
+   8) Firestore helpers (same as before)
    ====================== */
-function roomDocRef(roomId) {
-  return doc(db, 'rooms', roomId);
-}
-function peersCollectionRef(roomId) {
-  return collection(db, 'rooms', roomId, 'peers');
-}
-function signalsCollectionRef(roomId) {
-  return collection(db, 'rooms', roomId, 'signals');
-}
-function messagesCollectionRef(roomId) {
-  return collection(db, 'rooms', roomId, 'messages');
-}
+function roomDocRef(roomId){ return doc(db, 'rooms', roomId); }
+function peersCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'peers'); }
+function signalsCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'signals'); }
+function messagesCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'messages'); }
 
-/* write presence (peer doc) */
-async function writePeerPresence(roomId, peerId, meta = {}) {
+async function writePeerPresence(roomId, peerId, meta={}) {
   const peerRef = doc(db, 'rooms', roomId, 'peers', peerId);
   const payload = {
     name: meta.name || localState.displayName || 'Guest',
@@ -305,96 +261,48 @@ async function writePeerPresence(roomId, peerId, meta = {}) {
     peerId,
     online: true,
   };
-  try {
-    await setDoc(peerRef, payload);
-  } catch (err) {
-    console.error("Failed to write peer presence:", err);
-    throw err;
-  }
+  await setDoc(peerRef, payload);
 }
 
-/* delete presence */
 async function removePeerPresence(roomId, peerId) {
   const peerRef = doc(db, 'rooms', roomId, 'peers', peerId);
-  try {
-    await deleteDoc(peerRef);
-  } catch (err) {
-    console.warn("Failed to remove presence doc (it might be already removed):", err);
-  }
+  try { await deleteDoc(peerRef); } catch(e){ /*ignore*/ }
 }
 
-/* send signal (offer/answer/ice) */
 async function sendSignal(roomId, message) {
-  // message: { type: 'offer'|'answer'|'ice', from, to, payload }
   try {
-    await addDoc(signalsCollectionRef(roomId), {
-      ...message,
-      ts: serverTimestamp ? serverTimestamp() : Date.now()
-    });
-  } catch (err) {
-    console.error("Failed to send signal:", err, message);
-  }
+    await addDoc(signalsCollectionRef(roomId), { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() });
+  } catch (err) { console.error("Failed to send signal", err); }
 }
 
-/* send chat message to Firestore (global chat) */
 async function sendChatMessage(roomId, name, text) {
   if (!text || !text.trim()) return;
   try {
-    await addDoc(messagesCollectionRef(roomId), {
-      name,
-      text,
-      ts: serverTimestamp ? serverTimestamp() : Date.now(),
-      from: localState.peerId || null,
-    });
-  } catch (err) {
-    console.error("Failed to send chat message:", err);
-  }
+    await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null });
+  } catch (err) { console.error("Failed to send chat message", err); }
 }
 
 /* ======================
-   10) Peer connection creation and management
-   - createPeerConnectionFor(peerId, polite) -> sets up pc + data channel
-   - handleOffer/Answer/ICE
+   9) Peer connection helpers (same as before)
    ====================== */
-
-function makeNewPeerConnection(peerId, isOfferer = false) {
-  // If exists, return
+function makeNewPeerConnection(peerId, isOfferer=false) {
   if (localState.pcMap.has(peerId)) return localState.pcMap.get(peerId);
-
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-  // Ensure remote stream placeholder
   const remoteStream = new MediaStream();
   localState.remoteStreams.set(peerId, remoteStream);
 
-  // Add local tracks to PC
   if (localState.localStream) {
-    localState.localStream.getTracks().forEach(track => {
-      try {
-        pc.addTrack(track, localState.localStream);
-      } catch (err) {
-        console.warn("addTrack failed:", err);
-      }
-    });
+    localState.localStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.localStream); } catch(e) {} });
   }
-
-  // If screen sharing active, add its track too (but keep track/replacement logic elsewhere)
   if (localState.screenStream) {
-    localState.screenStream.getTracks().forEach(track => {
-      try { pc.addTrack(track, localState.screenStream); } catch (e) {}
-    });
+    localState.screenStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.screenStream); } catch(e) {} });
   }
 
-  // ontrack -> attach to remote stream
   pc.addEventListener('track', (evt) => {
-    // Some browsers give a MediaStream or track; add to remote stream
     if (evt.streams && evt.streams[0]) {
-      // uses stream provided
-      const s = evt.streams[0];
-      localState.remoteStreams.set(peerId, s);
-      setRemoteStreamOnTile(peerId, s);
+      localState.remoteStreams.set(peerId, evt.streams[0]);
+      setRemoteStreamOnTile(peerId, evt.streams[0]);
     } else {
-      // fallback: add track to existing remote stream
       const s = localState.remoteStreams.get(peerId) || new MediaStream();
       s.addTrack(evt.track);
       localState.remoteStreams.set(peerId, s);
@@ -402,391 +310,241 @@ function makeNewPeerConnection(peerId, isOfferer = false) {
     }
   });
 
-  // When new datachannel arrives (answerer side)
-  pc.addEventListener('datachannel', (evt) => {
-    const ch = evt.channel;
-    console.log('DataChannel received from', peerId, ch.label);
-    setupDataChannelHandlers(peerId, ch);
-  });
+  pc.addEventListener('datachannel', (evt) => setupDataChannelHandlers(peerId, evt.channel));
 
-  // ICE candidate -> forward to Firestore to 'to' peerId
   pc.addEventListener('icecandidate', async (evt) => {
     if (!evt.candidate) return;
-    // send candidate to the other peer
-    await sendSignal(localState.roomId, {
-      type: 'ice',
-      from: localState.peerId,
-      to: peerId,
-      payload: evt.candidate.toJSON ? evt.candidate.toJSON() : evt.candidate,
-    });
+    await sendSignal(localState.roomId, { type:'ice', from: localState.peerId, to: peerId, payload: evt.candidate.toJSON ? evt.candidate.toJSON() : evt.candidate });
   });
 
   pc.addEventListener('connectionstatechange', () => {
-    console.log(`Connection state with ${peerId}:`, pc.connectionState);
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
-      // consider cleanup
-      // don't immediately remove; wait for peer presence removal
-    }
+    console.log('pc state', peerId, pc.connectionState);
   });
 
-  // Save
   localState.pcMap.set(peerId, pc);
 
-  // If we are the offerer, create a data channel proactively
   if (isOfferer) {
     try {
       const dc = pc.createDataChannel('p2p-chat');
       setupDataChannelHandlers(peerId, dc);
       localState.dcMap.set(peerId, dc);
-    } catch (err) {
-      console.warn("Failed to create data channel:", err);
-    }
+    } catch(e) { console.warn('dc create failed', e); }
   }
-
   return pc;
 }
 
 function setupDataChannelHandlers(peerId, dc) {
-  dc.onopen = () => {
-    console.log("DataChannel open with", peerId);
-  };
-  dc.onclose = () => {
-    console.log("DataChannel closed", peerId);
-  };
-  dc.onerror = (e) => console.warn("DC error", e);
+  dc.onopen = () => console.log('DC open', peerId);
+  dc.onclose = () => console.log('DC close', peerId);
+  dc.onerror = (e) => console.warn('DC err', e);
   dc.onmessage = (evt) => {
-    // Expect chat messages; parse if JSON
     try {
       const data = JSON.parse(evt.data);
-      if (data && data.type === 'chat') {
-        appendLogToChat({ name: data.name || 'Peer', text: data.text || '', ts: data.ts || Date.now(), self: false });
-      }
-    } catch (err) {
-      // plain text fallback
-      appendLogToChat({ name: peerId, text: evt.data, ts: Date.now(), self: false });
+      if (data && data.type === 'chat') appendLogToChat({ name: data.name || 'Peer', text: data.text || '', ts: data.ts || Date.now(), self:false });
+    } catch (e) {
+      appendLogToChat({ name: peerId, text: evt.data, ts: Date.now(), self:false });
     }
   };
 }
 
-/* ======================
-   11) Offer / Answer flow
-   - When joining: for each existing peer, create pc (offerer) -> createOffer -> setLocalDesc -> send offer to that peer
-   - When receiving offer: create pc (answerer) if needed -> setRemoteDesc -> createAnswer -> setLocalDesc -> send answer
-   - Both exchange ICE via 'ice' messages
-   ====================== */
-
+/* Offer/answer/ice handlers (as before) */
 async function createAndSendOffer(roomId, toPeerId) {
   setStatus(`Creating offer for ${toPeerId}...`);
   const pc = makeNewPeerConnection(toPeerId, true);
   try {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-
-    // Send offer via Firestore signals collection (targeted to 'toPeerId')
-    await sendSignal(roomId, {
-      type: 'offer',
-      from: localState.peerId,
-      to: toPeerId,
-      payload: offer.sdp || offer, // include sdp object/string (for different browsers)
-    });
+    await sendSignal(roomId, { type:'offer', from: localState.peerId, to: toPeerId, payload: offer.sdp || offer });
     setStatus(`Offer sent to ${toPeerId}`);
-  } catch (err) {
-    console.error("createAndSendOffer failed:", err);
-  }
+  } catch (err) { console.error(err); }
 }
 
 async function handleIncomingOffer(roomId, message) {
   const { from: fromPeerId, payload } = message;
   setStatus(`Received offer from ${fromPeerId}`);
-
-  // Create PC (answerer)
   const pc = makeNewPeerConnection(fromPeerId, false);
-
   try {
-    // Some Firestore clients may send the SDP string directly; create RTCSessionDescription if needed
     const desc = (typeof payload === 'string' || payload.sdp) ? { type: 'offer', sdp: (payload.sdp || payload) } : payload;
     await pc.setRemoteDescription(desc);
-
-    // create datachannel handlers will be set by 'datachannel' event for pc (we didn't create a DC here)
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-
-    // send answer back
-    await sendSignal(roomId, {
-      type: 'answer',
-      from: localState.peerId,
-      to: fromPeerId,
-      payload: answer.sdp || answer,
-    });
+    await sendSignal(roomId, { type:'answer', from: localState.peerId, to: fromPeerId, payload: answer.sdp || answer });
     setStatus(`Answer sent to ${fromPeerId}`);
-  } catch (err) {
-    console.error("handleIncomingOffer failed:", err);
-  }
+  } catch (err) { console.error(err); }
 }
 
 async function handleIncomingAnswer(message) {
-  const { from: fromPeerId, payload } = message;
-  setStatus(`Received answer from ${fromPeerId}`);
-  const pc = localState.pcMap.get(fromPeerId);
-  if (!pc) {
-    console.warn("No RTCPeerConnection for this answer (peerId)", fromPeerId);
-    return;
-  }
+  const { from, payload } = message;
+  const pc = localState.pcMap.get(from);
+  if (!pc) return console.warn('No PC for answer', from);
   try {
-    const desc = (typeof payload === 'string' || payload.sdp) ? { type: 'answer', sdp: (payload.sdp || payload) } : payload;
+    const desc = (typeof payload === 'string' || payload.sdp) ? { type:'answer', sdp: (payload.sdp || payload) } : payload;
     await pc.setRemoteDescription(desc);
-  } catch (err) {
-    console.error("Failed to set remote description for answer:", err);
-  }
+  } catch (err) { console.error(err); }
 }
 
 async function handleIncomingIce(message) {
-  const { from: fromPeerId, payload } = message;
-  const pc = localState.pcMap.get(fromPeerId);
-  if (!pc) {
-    console.warn('No PC to add ICE candidate for', fromPeerId);
-    return;
-  }
-  try {
-    const cand = payload;
-    await pc.addIceCandidate(cand);
-  } catch (err) {
-    console.warn('addIceCandidate failed:', err);
-  }
+  const { from, payload } = message;
+  const pc = localState.pcMap.get(from);
+  if (!pc) return console.warn('No PC for ice', from);
+  try { await pc.addIceCandidate(payload); } catch (err) { console.warn('addIceCandidate failed', err); }
 }
 
 /* ======================
-   12) Firestore listeners: peers, signals, messages
-   - listenForPeers() : watches peers collection to detect joins/leaves
-   - listenForSignals(): watches signals collection for offer/answer/ice targeted to me
-   - listenForMessages(): watches chat messages
+   10) Firestore listeners (peers/signals/messages)
+   - store peer metadata for sorting/hiding
    ====================== */
 
 function startListeningToSignals(roomId) {
-  const signalsRef = signalsCollectionRef(roomId);
-  // We only need messages targeted to us (to == our peerId) or broadcast (to == 'all')
-  const q = query(signalsRef, orderBy('ts'));
+  const q = query(signalsCollectionRef(roomId), orderBy('ts'));
   const unsub = onSnapshot(q, (snapshot) => {
     snapshot.docChanges().forEach(async change => {
-      if (change.type !== 'added') return; // ignoring modifies/removes for simplicity
+      if (change.type !== 'added') return;
       const docData = change.doc.data();
       const { type, from, to, payload } = docData;
-      // ignore messages from self
       if (from === localState.peerId) return;
-      // message addressed to someone else -> ignore
       if (to && to !== localState.peerId && to !== 'all') return;
-
-      // Process by type
       try {
-        if (type === 'offer') {
-          await handleIncomingOffer(roomId, { from, payload });
-        } else if (type === 'answer') {
-          await handleIncomingAnswer({ from, payload });
-        } else if (type === 'ice') {
-          await handleIncomingIce({ from, payload });
-        } else {
-          console.warn('Unknown signal type', type);
-        }
-      } catch (err) {
-        console.error('Error processing signal', err);
-      }
+        if (type === 'offer') await handleIncomingOffer(roomId, { from, payload });
+        else if (type === 'answer') await handleIncomingAnswer({ from, payload });
+        else if (type === 'ice') await handleIncomingIce({ from, payload });
+      } catch (e) { console.error(e); }
     });
-  }, err => {
-    console.error("Signals snapshot error:", err);
-  });
-
+  }, err => console.error('Signals snapshot error', err));
   localState.unsubscribers.push(unsub);
   return unsub;
 }
 
 function startListeningToPeers(roomId) {
-  const peersRef = peersCollectionRef(roomId);
-  const q = query(peersRef);
+  const q = query(peersCollectionRef(roomId));
   const unsub = onSnapshot(q, async (snapshot) => {
-    // When snapshot initially loads, we will get all existing peers
     snapshot.docChanges().forEach(async change => {
       const data = change.doc.data();
       const pid = data.peerId || change.doc.id;
       if (change.type === 'added') {
-        // A new peer joined. If it's not us, we should create an offer to them (newcomer vs existing)
-        if (pid === localState.peerId) return;
+        if (pid === localState.peerId) {
+          // if server writes back our own presence, store meta
+          try {
+            const createdAtMs = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : (data.createdAt || Date.now());
+            localState.peerMeta.set(pid, { name: data.name || localState.displayName, createdAtMs });
+          } catch (e) { localState.peerMeta.set(pid, { name: data.name || localState.displayName, createdAtMs: Date.now() }); }
+          return;
+        }
         setStatus(`Peer joined: ${pid}`);
         addRemoteTile(pid, data.name || 'Participant');
+        try {
+          const createdAtMs = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : (data.createdAt || Date.now());
+          localState.peerMeta.set(pid, { name: data.name || 'Participant', createdAtMs });
+        } catch (e) { localState.peerMeta.set(pid, { name: data.name || 'Participant', createdAtMs: Date.now() }); }
 
-        // If we joined earlier than this peer, we should create an offer to them.
-        // Simple approach: create offer whenever we see an added peer that is not us,
-        // but avoid creating duplicate offers by checking if a PC exists.
         if (!localState.pcMap.has(pid)) {
-          // start outgoing offer to the new peer
-          await createAndSendOffer(roomId, pid);
+          createAndSendOffer(roomId, pid).catch(err => console.error(err));
         }
       } else if (change.type === 'removed') {
-        // Peer left; cleanup sockets + UI
         setStatus(`Peer left: ${pid}`);
         const pc = localState.pcMap.get(pid);
-        if (pc) {
-          try { pc.close(); } catch(e) {}
-          localState.pcMap.delete(pid);
-        }
+        if (pc) { try { pc.close(); } catch (e) {} localState.pcMap.delete(pid); }
         localState.remoteStreams.delete(pid);
         localState.dcMap.delete(pid);
+        localState.peerMeta.delete(pid);
         removeTile(pid);
       } else if (change.type === 'modified') {
-        // metadata updated (e.g., displayName)
         const tileName = document.querySelector(`#tile-${pid} .name`);
         if (tileName && data.name) tileName.textContent = data.name;
+        try {
+          const createdAtMs = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : (data.createdAt || Date.now());
+          const prev = localState.peerMeta.get(pid) || {};
+          localState.peerMeta.set(pid, { name: data.name || prev.name || 'Participant', createdAtMs });
+        } catch (e) {}
       }
     });
     updateParticipantsClass();
-  }, err => console.error("Peers snapshot error:", err));
-
+  }, err => console.error('Peers snapshot error', err));
   localState.unsubscribers.push(unsub);
   return unsub;
 }
 
 function startListeningToMessages(roomId) {
-  const messagesRef = messagesCollectionRef(roomId);
-  const q = query(messagesRef, orderBy('ts'));
+  const q = query(messagesCollectionRef(roomId), orderBy('ts'));
   const unsub = onSnapshot(q, (snapshot) => {
     snapshot.docChanges().forEach(change => {
       if (change.type !== 'added') return;
       const msg = change.doc.data();
-      appendLogToChat({
-        name: msg.name || 'Anon',
-        text: msg.text || '',
-        ts: (msg.ts && msg.ts.toMillis) ? msg.ts.toMillis() : (msg.ts || Date.now()),
-        self: msg.from === localState.peerId,
-      });
+      appendLogToChat({ name: msg.name || 'Anon', text: msg.text || '', ts: (msg.ts && msg.ts.toMillis) ? msg.ts.toMillis() : (msg.ts || Date.now()), self: msg.from === localState.peerId });
     });
-  }, err => console.error("Messages snapshot error:", err));
-
+  }, err => console.error('Messages snapshot error', err));
   localState.unsubscribers.push(unsub);
   return unsub;
 }
 
 /* ======================
-   13) High-level join / leave flows
+   11) Join / Leave flows (with polling start/stop)
    ====================== */
 
 async function joinRoom(roomIdInput) {
-  const roomId = (roomIdInput && String(roomIdInput).trim()) || (window.location.hash ? window.location.hash.replace('#', '') : '');
-  if (!roomId) {
-    setStatus('Masukkan Room ID sebelum join');
-    return;
-  }
+  const roomId = (roomIdInput && String(roomIdInput).trim()) || (window.location.hash ? window.location.hash.replace('#','') : '');
+  if (!roomId) { setStatus('Masukkan Room ID sebelum join'); return; }
   localState.roomId = roomId;
-  // create unique peerId
   localState.peerId = genId('p-');
-  // display name from input
   const dn = el.displayNameInput && el.displayNameInput.value;
   if (dn && dn.trim()) localState.displayName = dn.trim();
-
   setStatus(`Joining ${roomId} as ${localState.peerId} (${localState.displayName})`);
 
-  // show share URL (use current href with hash)
   try {
-    const href = new URL(window.location.href);
-    href.hash = roomId;
-    if (el.shareUrl) el.shareUrl.textContent = href.toString();
-  } catch (e) {
-    if (el.shareUrl) el.shareUrl.textContent = `${window.location.href}#${roomId}`;
-  }
+    const href = new URL(window.location.href); href.hash = roomId; if (el.shareUrl) el.shareUrl.textContent = href.toString();
+  } catch (e) { if (el.shareUrl) el.shareUrl.textContent = `${window.location.href}#${roomId}`; }
 
-  // 1) Ensure we have local media
-  try {
-    await ensureLocalStream();
-  } catch (err) {
-    // user denied camera/mic -> still allow join but without tracks
-    console.warn('Continuing without local media');
-  }
+  try { await ensureLocalStream(); } catch (e) { console.warn('Continue without local media'); }
 
-  // 2) write presence doc
   try {
     await writePeerPresence(roomId, localState.peerId, { name: localState.displayName });
-  } catch (err) {
-    console.error('Failed to write presence to Firestore:', err);
-    setStatus('Gagal bergabung (Firestore). Cek koneksi / aturan keamanan.');
-    return;
-  }
+  } catch (err) { console.error('Failed to write presence', err); setStatus('Gagal bergabung (Firestore).'); return; }
 
-  // 3) listen for peers (to create offers to existing peers)
   startListeningToPeers(roomId);
-
-  // 4) listen for signals (offer/answer/ice)
   startListeningToSignals(roomId);
-
-  // 5) listen for chat messages
   startListeningToMessages(roomId);
 
-  // 6) fetch existing peers to create offers proactively
   try {
     const peersSnap = await getDocs(peersCollectionRef(roomId));
     peersSnap.forEach(docSnap => {
       const data = docSnap.data();
       const pid = data.peerId || docSnap.id;
-      // avoid making an offer to ourselves and to duplicates
-      if (pid !== localState.peerId && !localState.pcMap.has(pid)) {
-        // Create outgoing offer to existing peer
-        createAndSendOffer(roomId, pid).catch(err => console.error(err));
-      }
+      if (pid !== localState.peerId && !localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e=>console.error(e));
     });
-  } catch (err) {
-    console.warn('Could not fetch peers list upfront:', err);
-  }
+  } catch (e) { console.warn('Could not fetch peers upfront', e); }
 
-  // UI: enable/disable buttons
   if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = false;
   if (el.createRoomBtn) el.createRoomBtn.disabled = true;
   setStatus(`Joined room ${roomId}. Waiting for peers...`);
 
-  // update URL hash for sharing
-  try { window.location.hash = roomId; } catch (e) {}
+  // start polling video state for auto-hide logic
+  startVideoStatePolling();
+
+  try { window.location.hash = roomId; } catch(e){}
 }
 
 async function leaveRoom() {
   const roomId = localState.roomId;
   setStatus('Leaving room...');
-  // Close all peer connections
-  for (const [peerId, pc] of localState.pcMap.entries()) {
-    try { pc.close(); } catch (e) {}
-  }
-  localState.pcMap.clear();
-  localState.dcMap.clear();
+  for (const [peerId, pc] of localState.pcMap.entries()) { try { pc.close(); } catch(e){} }
+  localState.pcMap.clear(); localState.dcMap.clear();
 
-  // Remove presence doc
   if (roomId && localState.peerId) {
-    try {
-      await removePeerPresence(roomId, localState.peerId);
-    } catch (err) {
-      console.warn('Could not remove presence doc during leave', err);
-    }
+    try { await removePeerPresence(roomId, localState.peerId); } catch(e) { console.warn(e); }
   }
-
-  // Unsubscribe from Firestore listeners
-  localState.unsubscribers.forEach(unsub => {
-    try { unsub(); } catch (e) {}
-  });
+  localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e){} });
   localState.unsubscribers = [];
 
-  // UI cleanup
-  // remove remote tiles
+  stopVideoStatePolling();
+
   const tiles = Array.from(el.videos.querySelectorAll('.vid'));
   tiles.forEach(t => t.remove());
-  // also local preview stream remains; if you prefer remove, you can stop tracks
-  // stop local media and screen
-  if (localState.localStream) {
-    localState.localStream.getTracks().forEach(t => t.stop());
-    localState.localStream = null;
-  }
-  if (localState.screenStream) {
-    localState.screenStream.getTracks().forEach(t => t.stop());
-    localState.screenStream = null;
-  }
 
-  // Reset state
-  localState.roomId = null;
-  localState.peerId = null;
-  localState.remoteStreams.clear();
+  if (localState.localStream) { localState.localStream.getTracks().forEach(t => t.stop()); localState.localStream = null; }
+  if (localState.screenStream) { localState.screenStream.getTracks().forEach(t => t.stop()); localState.screenStream = null; }
+
+  localState.roomId = null; localState.peerId = null; localState.remoteStreams.clear();
+  localState.peerMeta.clear();
 
   if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = true;
   if (el.createRoomBtn) el.createRoomBtn.disabled = false;
@@ -794,78 +552,41 @@ async function leaveRoom() {
   updateParticipantsClass();
 }
 
-/* Cleanup on page unload */
-window.addEventListener('beforeunload', async (ev) => {
-  try {
-    if (localState.roomId && localState.peerId) {
-      await removePeerPresence(localState.roomId, localState.peerId);
-    }
-  } catch (err) {
-    // ignore
-  }
-  // stop tracks
-  if (localState.localStream) localState.localStream.getTracks().forEach(t => t.stop());
-  if (localState.screenStream) localState.screenStream.getTracks().forEach(t => t.stop());
+/* ensure polling stopped on unload and presence removed */
+window.addEventListener('beforeunload', async () => {
+  stopVideoStatePolling();
+  try { if (localState.roomId && localState.peerId) await removePeerPresence(localState.roomId, localState.peerId); } catch(e){}
+  if (localState.localStream) localState.localStream.getTracks().forEach(t=>t.stop());
+  if (localState.screenStream) localState.screenStream.getTracks().forEach(t=>t.stop());
 });
 
 /* ======================
-   14) Signal message ingestion (helper)
-   - To avoid concurrency pitfalls, we listen to all signals but ignore messages not for us
-   - Clean up old signals can be done via backend or periodic cleanup (not implemented here)
-   ====================== */
-/* Note: startListeningToSignals created above handles message processing */
-
-/* ======================
-   15) Screen sharing (replace or add track to each RTCPeerConnection)
+   12) Screen share (same behavior)
    ====================== */
 async function startScreenShare() {
-  if (!navigator.mediaDevices.getDisplayMedia) {
-    setStatus('Screen share tidak didukung di browser ini');
-    return;
-  }
+  if (!navigator.mediaDevices.getDisplayMedia) { setStatus('Screen share tidak didukung'); return; }
   try {
-    const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    const screenStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:false });
     localState.screenStream = screenStream;
-
-    // Add a visible screen tile for local user (optional)
     const screenTileId = `screen-${localState.peerId || 'local'}`;
-    // create special tile to show screen preview
-    const tile = addRemoteTile(screenTileId, `${localState.displayName} (screen)`);
+    addRemoteTile(screenTileId, `${localState.displayName} (screen)`);
     const videoEl = document.querySelector(`#tile-${screenTileId} video`);
     if (videoEl) videoEl.srcObject = screenStream;
 
-    // Replace video sender track on each pc if possible (replaceTrack)
     for (const [peerId, pc] of localState.pcMap.entries()) {
       const senders = pc.getSenders().filter(s => s.track && s.track.kind === 'video');
       if (senders.length > 0) {
-        try {
-          await senders[0].replaceTrack(screenStream.getVideoTracks()[0]);
-        } catch (err) {
-          // fallback: addTrack (may create duplicate)
-          try {
-            pc.addTrack(screenStream.getVideoTracks()[0], screenStream);
-          } catch (e) { console.warn('Failed to add screen track to pc', e); }
-        }
-      } else {
-        // no existing sender -> addTrack
-        try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch (e) {}
-      }
+        try { await senders[0].replaceTrack(screenStream.getVideoTracks()[0]); } catch(e){ try{ pc.addTrack(screenStream.getVideoTracks()[0], screenStream); }catch(e){} }
+      } else { try{ pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e) {} }
     }
 
-    // When screen sharing stops, restore original camera video to senders
     screenStream.getVideoTracks()[0].addEventListener('ended', async () => {
-      // remove screen tile
       removeTile(screenTileId);
-      // restore camera track if available
       if (localState.localStream && localState.localStream.getVideoTracks().length > 0) {
         for (const [peerId, pc] of localState.pcMap.entries()) {
           const senders = pc.getSenders().filter(s => s.track && s.track.kind === 'video');
           if (senders.length > 0) {
-            try {
-              await senders[0].replaceTrack(localState.localStream.getVideoTracks()[0]);
-            } catch (err) {
-              console.warn('Failed to restore camera track to sender', err);
-            }
+            try { await senders[0].replaceTrack(localState.localStream.getVideoTracks()[0]); } catch(e) { console.warn(e); }
           }
         }
       }
@@ -873,206 +594,237 @@ async function startScreenShare() {
     });
 
     setStatus('You are sharing your screen');
-  } catch (err) {
-    console.error('Screen share failed', err);
-    setStatus('Gagal membagikan layar');
-  }
+  } catch (err) { console.error(err); setStatus('Gagal membagikan layar'); }
 }
 
 /* ======================
-   16) Chat UI wiring (Firestore chat)
+   13) Chat wiring
    ====================== */
 if (el.chatForm) {
   el.chatForm.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const text = el.chatInput.value || '';
-    if (!localState.roomId) {
-      setStatus('Belum join room — chat tidak terkirim');
-      return;
-    }
+    if (!localState.roomId) { setStatus('Belum join room — chat tidak terkirim'); return; }
     await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text);
-    // append locally immediately for responsiveness
-    appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
+    appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self:true });
     el.chatInput.value = '';
   });
-  // also handle button click if present
-  if (el.sendChatBtn) {
-    el.sendChatBtn.addEventListener('click', (ev) => {
-      el.chatForm.dispatchEvent(new Event('submit', { cancelable: true }));
-    });
-  }
+  if (el.sendChatBtn) el.sendChatBtn.addEventListener('click', ()=> el.chatForm.dispatchEvent(new Event('submit',{cancelable:true})));
 }
 
 /* ======================
-   17) Controls wiring: room join/leave, mic/cam, share screen
+   14) Controls wiring
    ====================== */
-if (el.createRoomBtn) {
-  el.createRoomBtn.addEventListener('click', (ev) => {
-    const rid = el.roomIdInput.value.trim();
-    joinRoom(rid).catch(err => console.error('JoinRoom error', err));
-  });
-}
-
-if (el.leaveRoomBtn) {
-  el.leaveRoomBtn.addEventListener('click', (ev) => {
-    leaveRoom().catch(err => console.error('LeaveRoom error', err));
-  });
-}
-
-if (el.toggleMicBtn) {
-  el.toggleMicBtn.addEventListener('click', (ev) => {
-    if (!localState.localStream) return;
-    const enabled = localState.localStream.getAudioTracks().some(t => t.enabled);
-    setMicEnabled(!enabled);
-  });
-}
-
-if (el.toggleCamBtn) {
-  el.toggleCamBtn.addEventListener('click', (ev) => {
-    if (!localState.localStream) return;
-    const enabled = localState.localStream.getVideoTracks().some(t => t.enabled);
-    setCamEnabled(!enabled);
-  });
-}
-
-if (el.shareScreenBtn) {
-  el.shareScreenBtn.addEventListener('click', (ev) => {
-    startScreenShare().catch(err => console.error(err));
-  });
-}
-
-/* Display name input updates the localState and presence doc (if joined) */
-if (el.displayNameInput) {
-  el.displayNameInput.addEventListener('change', async (ev) => {
-    const nm = el.displayNameInput.value.trim() || 'Guest';
-    localState.displayName = nm;
-    // update presence doc if already joined
-    if (localState.roomId && localState.peerId) {
-      try {
-        await writePeerPresence(localState.roomId, localState.peerId, { name: nm });
-      } catch (err) {
-        console.warn('Failed to update displayName in presence doc', err);
-      }
-    }
-  });
-}
+if (el.createRoomBtn) el.createRoomBtn.addEventListener('click', ()=> joinRoom(el.roomIdInput.value.trim()).catch(console.error));
+if (el.leaveRoomBtn) el.leaveRoomBtn.addEventListener('click', ()=> leaveRoom().catch(console.error));
+if (el.toggleMicBtn) el.toggleMicBtn.addEventListener('click', ()=> {
+  if (!localState.localStream) return;
+  const enabled = localState.localStream.getAudioTracks().some(t=>t.enabled);
+  setMicEnabled(!enabled);
+});
+if (el.toggleCamBtn) el.toggleCamBtn.addEventListener('click', ()=> {
+  if (!localState.localStream) return;
+  const enabled = localState.localStream.getVideoTracks().some(t=>t.enabled);
+  setCamEnabled(!enabled);
+});
+if (el.shareScreenBtn) el.shareScreenBtn.addEventListener('click', ()=> startScreenShare().catch(console.error));
+if (el.displayNameInput) el.displayNameInput.addEventListener('change', async ()=> {
+  const nm = el.displayNameInput.value.trim() || 'Guest'; localState.displayName = nm;
+  if (localState.roomId && localState.peerId) try { await writePeerPresence(localState.roomId, localState.peerId, { name: nm }); } catch(e){ console.warn(e); }
+});
 
 /* ======================
-   18) Utility: show initial local preview even before join
+   15) Initial preview attempt
    ====================== */
-(async function tryInitPreview() {
-  // Try to get a small local stream preview to show user, but don't fail if denied.
+(async function tryInitPreview(){
   try {
     if (!localState.localStream) {
-      await ensureLocalStream({ audio: true, video: { width: 640, height: 360 } });
-      // default mic/cam on
-      setMicEnabled(true);
-      setCamEnabled(true);
+      await ensureLocalStream({ audio:true, video:{ width:640, height:360 } });
+      setMicEnabled(true); setCamEnabled(true);
     }
-  } catch (err) {
-    console.warn('Preview unavailable (user may have denied permissions).', err);
-  }
+  } catch (e) { console.warn('Preview not available', e); }
 })();
 
-/* -------------------------
-   Fit videos to viewport helper
-   Call this on load, on resize, and after participant tiles change
-   ------------------------- */
+/* ======================
+   16) Fit & layout helpers
+   - fitVideosToViewport() and layoutVideoGrid()
+   ====================== */
+
 function fitVideosToViewport() {
   try {
-    // elements that take vertical space
     const header = document.querySelector('.site-header');
-    const roomControls = document.querySelector('#room-controls'); // section container
-    const videoSection = document.querySelector('#video-section');
+    const roomControls = document.querySelector('#room-controls');
     const controls = document.querySelector('#video-section .controls') || document.querySelector('.controls');
     const footer = document.querySelector('.site-footer');
-
     const top = header ? header.getBoundingClientRect().height : 0;
     const roomH = roomControls ? roomControls.getBoundingClientRect().height : 0;
     const controlsH = controls ? controls.getBoundingClientRect().height : 0;
     const footerH = footer ? footer.getBoundingClientRect().height : 0;
-
-    // additional safety margins (padding/gaps)
-    const extras = 32; // you can tune this (margins + breathing room)
-
-    // compute available height for the videos container
+    const extras = 32;
     const vh = window.innerHeight;
-    let available = Math.max(160, Math.floor(vh - (top + roomH + controlsH + footerH + extras)));
-
-    // if the sidebar is visible and taller than available, reduce available a bit more
-    // (not strictly necessary but helps when sidebar stacked)
-    // set CSS variable on root
+    const available = Math.max(160, Math.floor(vh - (top + roomH + controlsH + footerH + extras)));
     document.documentElement.style.setProperty('--videos-max-h', `${available}px`);
-
-    // choose scrolling policy:
-    // - if available is very small (<240), allow internal vertical scroll for .videos (mobile)
-    // - otherwise hide vertical scrollbar (grid will reflow and tiles shrink)
     const videosEl = document.querySelector('.videos');
-    if (videosEl) {
-      if (available < 260) {
-        videosEl.style.overflowY = 'auto';
-      } else {
-        videosEl.style.overflowY = 'hidden';
-      }
-    }
-  } catch (err) {
-    console.warn('fitVideosToViewport error', err);
-  }
+    if (videosEl) videosEl.style.overflowY = (available < 260) ? 'auto' : 'hidden';
+  } catch (err) { console.warn('fitVideosToViewport error', err); }
 }
 
-// call initially
-window.addEventListener('load', () => {
-  fitVideosToViewport();
-  // small delay to handle fonts/layout
-  setTimeout(fitVideosToViewport, 120);
-});
+function layoutVideoGrid() {
+  try {
+    const videosEl = document.querySelector('.videos');
+    if (!videosEl) return;
+    const tiles = Array.from(videosEl.querySelectorAll('.vid'));
+    const N = Math.max(tiles.length,1);
 
-// update on resize & orientation change
-window.addEventListener('resize', () => {
-  fitVideosToViewport();
-});
-// some devices fire orientationchange instead of resize
-window.addEventListener('orientationchange', () => {
-  setTimeout(fitVideosToViewport, 120);
-});
+    const header = document.querySelector('.site-header');
+    const roomControls = document.querySelector('#room-controls');
+    const controls = document.querySelector('#video-section .controls') || document.querySelector('.controls');
+    const footer = document.querySelector('.site-footer');
+    const headerH = header ? header.getBoundingClientRect().height : 0;
+    const roomH = roomControls ? roomControls.getBoundingClientRect().height : 0;
+    const controlsH = controls ? controls.getBoundingClientRect().height : 0;
+    const footerH = footer ? footer.getBoundingClientRect().height : 0;
+    const extras = 28;
+    const availableHeight = Math.max(160, Math.floor(window.innerHeight - (headerH + roomH + controlsH + footerH + extras)));
 
-/* IMPORTANT:
-   Call fitVideosToViewport() after you modify tiles (e.g., at end of updateParticipantsClass())
-   so grid recalculates using latest tile count / layout.
-   Example: put fitVideosToViewport(); inside updateParticipantsClass() after class changes.
-*/
+    const containerRect = videosEl.getBoundingClientRect();
+    const containerWidth = containerRect.width && containerRect.width > 0 ? containerRect.width : (window.innerWidth - (document.querySelector('.sidebar') ? document.querySelector('.sidebar').getBoundingClientRect().width : 0) - 40);
+
+    const aspectRatio = 16/9;
+    let best = { cols:1, rows:N, tileWidth:containerWidth, tileHeight:Math.floor(containerWidth/aspectRatio), totalHeight: Math.ceil(N)*Math.floor(containerWidth/aspectRatio), fits:false, overflow: Infinity };
+
+    const gap = parseFloat(getComputedStyle(videosEl).gap || 12);
+    const maxCols = Math.min(N, Math.max(1, Math.floor(containerWidth / 160)));
+
+    for (let cols=1; cols<=maxCols; cols++) {
+      const tileW = (containerWidth - (cols - 1) * gap) / cols;
+      const tileH = tileW / aspectRatio;
+      const rows = Math.ceil(N / cols);
+      const totalH = rows * tileH + (rows - 1) * gap;
+      const overflow = Math.max(0, totalH - availableHeight);
+      const fits = totalH <= availableHeight;
+      if (fits) {
+        if (!best.fits || tileH > best.tileHeight) best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits, overflow };
+      } else {
+        if (!best.fits) {
+          if (overflow < best.overflow || (Math.abs(overflow - best.overflow) < 1 && tileH > best.tileHeight)) {
+            best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits:false, overflow };
+          }
+        }
+      }
+    }
+
+    const minTileH = 100;
+    const tileHpx = Math.max(minTileH, Math.floor(best.tileHeight));
+    const colsToUse = best.cols;
+
+    videosEl.style.gridTemplateColumns = `repeat(${colsToUse}, 1fr)`;
+    videosEl.style.setProperty('--tile-height', `${tileHpx}px`);
+    videosEl.style.setProperty('--videos-max-h', `${availableHeight}px`);
+    tiles.forEach(t => { t.style.height = `${tileHpx}px`; });
+
+    videosEl.style.overflowY = best.fits ? 'hidden' : 'auto';
+
+    const statusEl = document.querySelector('#status');
+    if (statusEl) statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${best.rows} • ${best.fits ? 'fit' : 'scroll'}`;
+  } catch (err) { console.warn('layoutVideoGrid error', err); }
+}
+
+window.addEventListener('load', ()=>{ fitVideosToViewport(); setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
+window.addEventListener('resize', ()=>{ fitVideosToViewport(); layoutVideoGrid(); });
+window.addEventListener('orientationchange', ()=>{ setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
 
 /* ======================
-   19) Small UX improvements: keyboard shortcuts, helpful hints
+   17) Visibility rules: hide extras (>maxVisible)
+   - Prioritize: local -> cam-on -> older join time
+   ====================== */
+
+function applyVisibilityRules(maxVisible = 4) {
+  try {
+    const videosEl = document.querySelector('.videos');
+    if (!videosEl) return;
+    const tiles = Array.from(videosEl.querySelectorAll('.vid'));
+    const total = tiles.length;
+    if (total <= maxVisible) {
+      tiles.forEach(t => { t.classList.remove('hidden-by-limit'); t.style.display=''; t.setAttribute('aria-hidden','false'); });
+      setStatus(`${total} peserta`);
+      layoutVideoGrid();
+      return;
+    }
+
+    const infos = tiles.map(t => {
+      const peer = t.dataset.peer || t.id || '';
+      const isLocal = t.classList.contains('local') || peer === localState.peerId;
+      const hasVideo = (t.dataset._hasvideo === 'true');
+      const meta = localState.peerMeta.get(peer) || {};
+      const createdAtMs = meta.createdAtMs || 0;
+      return { tileEl: t, peer, isLocal, hasVideo, createdAtMs };
+    });
+
+    infos.sort((a,b) => {
+      if (a.isLocal && !b.isLocal) return -1;
+      if (!a.isLocal && b.isLocal) return 1;
+      if (a.hasVideo && !b.hasVideo) return -1;
+      if (!a.hasVideo && b.hasVideo) return 1;
+      return (a.createdAtMs || 0) - (b.createdAtMs || 0);
+    });
+
+    const visible = infos.slice(0, maxVisible);
+    const visiblePeers = new Set(visible.map(i => i.peer));
+    infos.forEach(info => {
+      const tile = info.tileEl;
+      if (visiblePeers.has(info.peer)) {
+        tile.classList.remove('hidden-by-limit'); tile.style.display=''; tile.setAttribute('aria-hidden','false');
+      } else {
+        tile.classList.add('hidden-by-limit'); tile.style.display='none'; tile.setAttribute('aria-hidden','true');
+      }
+    });
+
+    const hiddenCount = total - visiblePeers.size;
+    setStatus(`${total} peserta • ${hiddenCount} disembunyikan`);
+    layoutVideoGrid();
+  } catch (err) { console.warn('applyVisibilityRules error', err); }
+}
+
+/* Polling to detect camera on/off changes (lightweight) */
+function detectVideoStateAndApply(maxVisible = 4) {
+  try {
+    const videosEl = document.querySelector('.videos');
+    if (!videosEl) return;
+    const tiles = Array.from(videosEl.querySelectorAll('.vid'));
+    let changed = false;
+    for (const t of tiles) {
+      const videoEl = t.querySelector('video');
+      let hasVideo = false;
+      try {
+        if (videoEl && videoEl.srcObject) {
+          const vtracks = (videoEl.srcObject.getVideoTracks && videoEl.srcObject.getVideoTracks()) || [];
+          hasVideo = vtracks.some(tr => tr && tr.enabled !== false);
+        }
+      } catch (e) { hasVideo = false; }
+      const prev = t.dataset._hasvideo === 'true';
+      if (prev !== hasVideo) { t.dataset._hasvideo = hasVideo ? 'true' : 'false'; changed = true; }
+    }
+    if (changed) applyVisibilityRules(maxVisible);
+  } catch (e) { console.warn('detectVideoStateAndApply error', e); }
+}
+
+function startVideoStatePolling() {
+  if (localState._videoDetectInterval) return;
+  localState._videoDetectInterval = setInterval(() => detectVideoStateAndApply(4), 1200);
+}
+function stopVideoStatePolling() {
+  if (localState._videoDetectInterval) { clearInterval(localState._videoDetectInterval); localState._videoDetectInterval = null; }
+}
+
+/* ======================
+   18) Keyboard shortcuts & debug
    ====================== */
 window.addEventListener('keydown', (ev) => {
-  // simple shortcuts:
-  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'm') {
-    // Ctrl/Cmd + M toggles mic
-    ev.preventDefault();
-    if (localState.localStream) {
-      const enabled = localState.localStream.getAudioTracks().some(t => t.enabled);
-      setMicEnabled(!enabled);
-    }
-  } else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'e') {
-    // Ctrl/Cmd + E toggles cam
-    ev.preventDefault();
-    if (localState.localStream) {
-      const enabled = localState.localStream.getVideoTracks().some(t => t.enabled);
-      setCamEnabled(!enabled);
-    }
-  }
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'm') { ev.preventDefault(); if (localState.localStream) setMicEnabled(!localState.localStream.getAudioTracks().some(t=>t.enabled)); }
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'e') { ev.preventDefault(); if (localState.localStream) setCamEnabled(!localState.localStream.getVideoTracks().some(t=>t.enabled)); }
 });
 
-/* ======================
-   20) Expose some debug functions to window for convenience (optional)
-   ====================== */
-window._pakelmeet = {
-  localState,
-  joinRoom,
-  leaveRoom,
-  setStatus,
-  sendChatMessage,
-};
+window._pakelmeet = { localState, joinRoom, leaveRoom, setStatus, sendChatMessage, applyVisibilityRules, layoutVideoGrid };
 
-/* End of app.js */
+/* End of file */

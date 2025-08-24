@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="id">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -27,7 +27,7 @@
 </head>
 <body>
   <!-- Skip link for keyboard users -->
-  <a href="#main" class="visually-hidden" aria-hidden="false">Lewati ke konten utama</a>
+  <a href="#main" class="visually-hidden" aria-hidden="false">Skip to main content</a>
 
   <div id="app" class="app-root" role="application" aria-labelledby="app-title">
 
@@ -38,7 +38,7 @@
       </div>
 
       <div class="meta" aria-hidden="true">
-        <p class="visually-hidden" id="description">Frontend hosted on GitHub Pages. Signaling recommended: Firebase Firestore.</p>
+        <p class="visually-hidden" id="description">Frontend hosted on GitHub Pages. Recommended signaling: Firebase Firestore.</p>
       </div>
     </header>
 
@@ -50,13 +50,13 @@
 
         <!-- Room controls -->
         <section aria-labelledby="room-controls-title" class="room-controls card" id="room-controls">
-          <h2 id="room-controls-title" class="visually-hidden">Kontrol Ruang</h2>
+          <h2 id="room-controls-title" class="visually-hidden">Room Controls</h2>
 
           <form id="roomForm" class="room-form" autocomplete="off" role="search" aria-label="Join or create meeting room" novalidate>
             <div class="form-field">
               <label for="roomId" class="label">Room ID</label>
-              <input id="roomId" name="room" type="text" inputmode="text" placeholder="mis. team-weekly-sync" aria-describedby="roomHint" required data-hook="room-id" />
-              <div id="roomHint" class="hint">Bisa berupa teks pendek — akan dipakai sebagai identifier ruangan (URL hash).</div>
+              <input id="roomId" name="room" type="text" inputmode="text" placeholder="e.g. team-weekly-sync" aria-describedby="roomHint" required data-hook="room-id" />
+              <div id="roomHint" class="hint">Short text used as the room identifier (also used in the URL hash).</div>
             </div>
 
             <div class="actions" aria-hidden="false">
@@ -65,7 +65,7 @@
             </div>
           </form>
 
-          <p class="share-url" aria-live="polite">Bagikan URL ruangan setelah join: <span id="shareUrl" data-hook="share-url">—</span></p>
+          <p class="share-url" aria-live="polite">Share the room URL after joining: <span id="shareUrl" data-hook="share-url">—</span></p>
         </section>
 
         <!-- Video grid and controls -->
@@ -94,10 +94,10 @@
         <h2 id="sidebar-title" class="visually-hidden">Sidebar</h2>
 
         <div class="card profile" aria-labelledby="profile-title">
-          <h3 id="profile-title" class="visually-hidden">Profil</h3>
+          <h3 id="profile-title" class="visually-hidden">Profile</h3>
           <label for="displayName" class="label">Display Name</label>
-          <input id="displayName" type="text" name="displayName" placeholder="Nama kamu" data-hook="display-name" />
-          <p class="hint">Nama akan tampil di tile video.</p>
+          <input id="displayName" type="text" name="displayName" placeholder="Your name" data-hook="display-name" />
+          <p class="hint">This name will be shown on your video tile.</p>
         </div>
 
         <div class="card chat" aria-labelledby="chat-title">
@@ -108,9 +108,9 @@
 
           <!-- Chat form: use submit for keyboard accessibility; JS should preventDefault and handle sending -->
           <form id="chatForm" class="chat-form" action="#" autocomplete="off" novalidate>
-            <label for="chatInput" class="visually-hidden">Ketik pesan</label>
-            <input id="chatInput" type="text" name="message" placeholder="Ketik pesan…" data-hook="chat-input" aria-label="Ketik pesan" />
-            <button id="sendChat" type="submit" data-hook="send-chat" class="button primary">Kirim</button>
+            <label for="chatInput" class="visually-hidden">Type message</label>
+            <input id="chatInput" type="text" name="message" placeholder="Type a message…" data-hook="chat-input" aria-label="Type a message" />
+            <button id="sendChat" type="submit" data-hook="send-chat" class="button primary">Send</button>
           </form>
         </div>
 
@@ -118,7 +118,7 @@
           <h3 id="status-title" class="visually-hidden">Status</h3>
           <label class="label">Status</label>
           <div id="status" data-hook="status" role="status" aria-live="polite">Idle</div>
-          <p class="small">Tips: Mesh cocok untuk 3–4 peserta. Untuk >4 gunakan SFU (Jitsi/mediasoup).</p>
+          <p class="small">Tip: Mesh is best for 3–4 participants. For larger groups consider an SFU (e.g. Jitsi/mediasoup).</p>
         </div>
       </aside>
 
@@ -126,7 +126,7 @@
 
     <!-- Footer -->
     <footer role="contentinfo" class="site-footer">
-      <p class="small">PakelMeet — lightweight frontend demo. <strong>Do not</strong> store sensitive data in Firestore without rules.</p>
+      <p class="small">PakelMeet — lightweight frontend demo. <strong>Do not</strong> store sensitive data in Firestore without proper security rules.</p>
     </footer>
 
     <!-- Templates used by JS to render tiles -->
@@ -143,7 +143,7 @@
     <!-- NoScript -->
     <noscript>
       <div class="noscript card">
-        <p>JavaScript diperlukan untuk menjalankan PakelMeet. Aktifkan JavaScript dan reload halaman.</p>
+        <p>JavaScript is required to run PakelMeet. Please enable JavaScript and reload the page.</p>
       </div>
     </noscript>
 
