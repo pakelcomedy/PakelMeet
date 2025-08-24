@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#0b0f14" />
+  <meta name="description" content="PakelMeet — lightweight P2P video meeting (3-4 users). Frontend-ready for hosting on GitHub Pages. Signaling: Firebase/Firestore." />
+
+  <title>PakelMeet — P2P Video Meeting</title>
+
+  <!-- Preconnect for Firebase / Google resources -->
+  <link rel="preconnect" href="https://www.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://www.googleapis.com" crossorigin>
+
+  <!-- Main stylesheet -->
+  <link rel="stylesheet" href="assets/css/style.css">
+
+  <!-- Favicon -->
+  <link rel="icon" href="assets/favicon.ico" />
+
+  <!-- Minimal inline fallback so layout stays readable without CSS -->
+  <style>
+    html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    #app{max-width:1100px;margin:0 auto;padding:18px}
+    .visually-hidden{position:absolute!important;height:1px;width:1px;overflow:hidden;clip:rect(1px,1px,1px,1px);white-space:nowrap}
+  </style>
+</head>
+<body>
+  <!-- Skip link for keyboard users -->
+  <a href="#main" class="visually-hidden" aria-hidden="false">Lewati ke konten utama</a>
+
+  <div id="app" class="app-root" role="application" aria-labelledby="app-title">
+
+    <!-- Header -->
+    <header role="banner" class="site-header">
+      <div class="brand" aria-hidden="false">
+        <h1 id="app-title">PakelMeet <small aria-hidden="true">— P2P Mesh (3–4 users)</small></h1>
+      </div>
+
+      <div class="meta" aria-hidden="true">
+        <p class="visually-hidden" id="description">Frontend hosted on GitHub Pages. Signaling recommended: Firebase Firestore.</p>
+      </div>
+    </header>
+
+    <!-- Main: left column (controls + videos) + right sidebar (profile, chat, status) -->
+    <main id="main" role="main" tabindex="-1">
+
+      <!-- Left column -->
+      <div class="left-column">
+
+        <!-- Room controls -->
+        <section aria-labelledby="room-controls-title" class="room-controls card" id="room-controls">
+          <h2 id="room-controls-title" class="visually-hidden">Kontrol Ruang</h2>
+
+          <form id="roomForm" class="room-form" autocomplete="off" role="search" aria-label="Join or create meeting room" novalidate>
+            <div class="form-field">
+              <label for="roomId" class="label">Room ID</label>
+              <input id="roomId" name="room" type="text" inputmode="text" placeholder="mis. team-weekly-sync" aria-describedby="roomHint" required data-hook="room-id" />
+              <div id="roomHint" class="hint">Bisa berupa teks pendek — akan dipakai sebagai identifier ruangan (URL hash).</div>
+            </div>
+
+            <div class="actions" aria-hidden="false">
+              <button type="button" id="createRoom" data-hook="create-room" class="button primary" aria-pressed="false">Create / Join</button>
+              <button type="button" id="leaveRoom" data-hook="leave-room" class="button danger" disabled aria-pressed="false">Leave</button>
+            </div>
+          </form>
+
+          <p class="share-url" aria-live="polite">Bagikan URL ruangan setelah join: <span id="shareUrl" data-hook="share-url">—</span></p>
+        </section>
+
+        <!-- Video grid and controls -->
+        <section aria-labelledby="video-section-title" class="video-section card" id="video-section">
+          <h2 id="video-section-title" class="visually-hidden">Video Conference</h2>
+
+          <!-- Videos container
+               JS must toggle: #videos.classList = 'videos participants-N'
+               and append .vid children into this container -->
+          <div id="videos" class="videos" role="list" aria-label="Video tiles" tabindex="0">
+            <!-- JS will mount <div class="vid"> elements here -->
+          </div>
+
+          <!-- Controls (mic/cam/screen) -->
+          <div class="controls" role="group" aria-label="Meeting controls">
+            <button id="toggleMic" data-hook="toggle-mic" aria-pressed="false" title="Toggle microphone" class="button">🎙️ Mic</button>
+            <button id="toggleCam" data-hook="toggle-cam" aria-pressed="false" title="Toggle camera" class="button">🎥 Cam</button>
+            <button id="shareScreen" data-hook="share-screen" aria-pressed="false" title="Share your screen" class="button">🖥️ Share Screen</button>
+          </div>
+        </section>
+
+      </div> <!-- end left-column -->
+
+      <!-- Sidebar: display name, chat, status -->
+      <aside class="sidebar" aria-labelledby="sidebar-title" id="sidebar" role="complementary">
+        <h2 id="sidebar-title" class="visually-hidden">Sidebar</h2>
+
+        <div class="card profile" aria-labelledby="profile-title">
+          <h3 id="profile-title" class="visually-hidden">Profil</h3>
+          <label for="displayName" class="label">Display Name</label>
+          <input id="displayName" type="text" name="displayName" placeholder="Nama kamu" data-hook="display-name" />
+          <p class="hint">Nama akan tampil di tile video.</p>
+        </div>
+
+        <div class="card chat" aria-labelledby="chat-title">
+          <h3 id="chat-title">Chat</h3>
+
+          <!-- Chat log -->
+          <div id="chatBox" class="chat-box" role="log" aria-live="polite" aria-atomic="false"></div>
+
+          <!-- Chat form: use submit for keyboard accessibility; JS should preventDefault and handle sending -->
+          <form id="chatForm" class="chat-form" action="#" autocomplete="off" novalidate>
+            <label for="chatInput" class="visually-hidden">Ketik pesan</label>
+            <input id="chatInput" type="text" name="message" placeholder="Ketik pesan…" data-hook="chat-input" aria-label="Ketik pesan" />
+            <button id="sendChat" type="submit" data-hook="send-chat" class="button primary">Kirim</button>
+          </form>
+        </div>
+
+        <div class="card status" aria-labelledby="status-title">
+          <h3 id="status-title" class="visually-hidden">Status</h3>
+          <label class="label">Status</label>
+          <div id="status" data-hook="status" role="status" aria-live="polite">Idle</div>
+          <p class="small">Tips: Mesh cocok untuk 3–4 peserta. Untuk >4 gunakan SFU (Jitsi/mediasoup).</p>
+        </div>
+      </aside>
+
+    </main>
+
+    <!-- Footer -->
+    <footer role="contentinfo" class="site-footer">
+      <p class="small">PakelMeet — lightweight frontend demo. <strong>Do not</strong> store sensitive data in Firestore without rules.</p>
+    </footer>
+
+    <!-- Templates used by JS to render tiles -->
+    <template id="video-tile-template">
+      <div class="vid" role="listitem" data-peer="">
+        <video autoplay playsinline muted></video>
+        <div class="name" data-hook="video-name" aria-hidden="false"></div>
+        <div class="badges" aria-hidden="true">
+          <span class="badge mute" data-hook="badge-mute"></span>
+        </div>
+      </div>
+    </template>
+
+    <!-- NoScript -->
+    <noscript>
+      <div class="noscript card">
+        <p>JavaScript diperlukan untuk menjalankan PakelMeet. Aktifkan JavaScript dan reload halaman.</p>
+      </div>
+    </noscript>
+
+  </div> <!-- end #app -->
+
+  <!-- App script (module) -->
+  <script type="module" src="assets/js/app.js" defer></script>
+</body>
+</html>
