@@ -1,9 +1,9 @@
 /* =========================================================================
-   PakelMeet — assets/js/app.js (LATEST)
+   PakelMeet — assets/js/app.js (PRESENCE-HEARTBEAT + AUTO-LEAVE FIX)
    - Full WebRTC mesh with Firestore signaling & chat
-   - Automatically hides extra participants when >4 shown (prioritize cam-on)
-   - Polls video-track state to react to camera toggles
-   - Includes layout helpers to fit tiles to viewport
+   - Presence heartbeat: updates presence.lastSeen periodically
+   - Peers automatically considered "left" when lastSeen is stale
+   - Best-effort removal on beforeunload / visibilitychange
    ========================================================================= */
 
 /* ======================
@@ -41,9 +41,12 @@ signInAnonymously(auth).catch(err => console.error("Firebase anon sign-in failed
 onAuthStateChanged(auth, user => { currentUser = user; console.log("Auth:", user ? "anon" : "signed out"); });
 
 /* ======================
-   3) App state
+   3) App state & presence constants
    ====================== */
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+
+const PRESENCE_HEARTBEAT_MS = 5000;      // update our presence every 5s
+const PRESENCE_TIMEOUT_MS = 15000;       // consider peer offline if lastSeen older than 15s
 
 const localState = {
   roomId: null,
@@ -56,8 +59,9 @@ const localState = {
   screenStream: null,
   unsubscribers: [],
   listeners: {},
-  peerMeta: new Map(),            // peerId -> { name, createdAtMs }
+  peerMeta: new Map(),            // peerId -> { name, createdAtMs, lastSeenMs, online }
   _videoDetectInterval: null,     // polling interval id
+  _presenceHeartbeatInterval: null,
 };
 
 /* ======================
@@ -219,7 +223,7 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
     return s;
   } catch (err) {
     console.error("getUserMedia failed:", err);
-    setStatus('Gagal mengambil media — cek izin kamera/mikrofon');
+    setStatus('Failed to access camera/microphone — check permissions');
     throw err;
   }
 }
@@ -246,7 +250,7 @@ function setCamEnabled(enabled) {
 }
 
 /* ======================
-   8) Firestore helpers (same as before)
+   8) Firestore helpers (presence now includes lastSeen)
    ====================== */
 function roomDocRef(roomId){ return doc(db, 'rooms', roomId); }
 function peersCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'peers'); }
@@ -258,15 +262,34 @@ async function writePeerPresence(roomId, peerId, meta={}) {
   const payload = {
     name: meta.name || localState.displayName || 'Guest',
     createdAt: serverTimestamp ? serverTimestamp() : new Date(),
+    lastSeen: serverTimestamp ? serverTimestamp() : new Date(),
     peerId,
     online: true,
   };
-  await setDoc(peerRef, payload);
+  // write/overwrite presence doc
+  await setDoc(peerRef, payload, { merge: true });
 }
 
+// update lastSeen periodically (heartbeat)
+async function touchPeerPresence() {
+  if (!localState.roomId || !localState.peerId) return;
+  const peerRef = doc(db, 'rooms', localState.roomId, 'peers', localState.peerId);
+  try {
+    // set only lastSeen and online (merge)
+    await setDoc(peerRef, { lastSeen: serverTimestamp ? serverTimestamp() : new Date(), online: true }, { merge: true });
+  } catch (err) {
+    console.warn('touchPeerPresence failed', err);
+  }
+}
+
+// best-effort remove presence (called on leave/unload)
 async function removePeerPresence(roomId, peerId) {
   const peerRef = doc(db, 'rooms', roomId, 'peers', peerId);
-  try { await deleteDoc(peerRef); } catch(e){ /*ignore*/ }
+  try {
+    await deleteDoc(peerRef);
+  } catch (err) {
+    console.warn("Failed to remove presence doc (it might be already removed):", err);
+  }
 }
 
 async function sendSignal(roomId, message) {
@@ -283,7 +306,7 @@ async function sendChatMessage(roomId, name, text) {
 }
 
 /* ======================
-   9) Peer connection helpers (same as before)
+   9) Peer connection helpers
    ====================== */
 function makeNewPeerConnection(peerId, isOfferer=false) {
   if (localState.pcMap.has(peerId)) return localState.pcMap.get(peerId);
@@ -347,7 +370,7 @@ function setupDataChannelHandlers(peerId, dc) {
   };
 }
 
-/* Offer/answer/ice handlers (as before) */
+/* Offer/answer/ice handlers */
 async function createAndSendOffer(roomId, toPeerId) {
   setStatus(`Creating offer for ${toPeerId}...`);
   const pc = makeNewPeerConnection(toPeerId, true);
@@ -392,7 +415,7 @@ async function handleIncomingIce(message) {
 
 /* ======================
    10) Firestore listeners (peers/signals/messages)
-   - store peer metadata for sorting/hiding
+   - presence-aware: ignore or remove stale peers
    ====================== */
 
 function startListeningToSignals(roomId) {
@@ -417,25 +440,52 @@ function startListeningToSignals(roomId) {
 
 function startListeningToPeers(roomId) {
   const q = query(peersCollectionRef(roomId));
-  const unsub = onSnapshot(q, async (snapshot) => {
-    snapshot.docChanges().forEach(async change => {
+  const unsub = onSnapshot(q, (snapshot) => {
+    const nowMs = Date.now();
+    snapshot.docs.forEach(docSnap => {
+      const data = docSnap.data();
+      const pid = data.peerId || docSnap.id;
+      // convert timestamps to ms if Firestore Timestamp
+      const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
+      const onlineFlag = data.online === undefined ? true : !!data.online;
+      const createdAtMs = (data.createdAt && data.createdAt.toMillis) ? data.createdAt.toMillis() : (data.createdAt || nowMs);
+
+      // store metadata
+      localState.peerMeta.set(pid, { name: data.name || 'Participant', createdAtMs, lastSeenMs, online: onlineFlag });
+
+      // If this doc is stale (no recent heartbeat), treat as offline locally
+      const stale = (nowMs - lastSeenMs) > PRESENCE_TIMEOUT_MS;
+      if (stale || !onlineFlag) {
+        // if it's our doc and stale, ignore; if it's another peer and stale -> cleanup
+        if (pid !== localState.peerId) {
+          // close PC if exists
+          const pc = localState.pcMap.get(pid);
+          if (pc) { try { pc.close(); } catch(e) {} localState.pcMap.delete(pid); }
+          // remove tile/UI
+          removeTile(pid);
+          localState.remoteStreams.delete(pid);
+          localState.dcMap.delete(pid);
+          localState.peerMeta.delete(pid);
+          return; // skip creating offers to stale peers
+        }
+      }
+    });
+
+    // Process docChanges to detect added/removed/modified using conventional flow
+    snapshot.docChanges().forEach(change => {
       const data = change.doc.data();
       const pid = data.peerId || change.doc.id;
       if (change.type === 'added') {
-        if (pid === localState.peerId) {
-          // if server writes back our own presence, store meta
-          try {
-            const createdAtMs = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : (data.createdAt || Date.now());
-            localState.peerMeta.set(pid, { name: data.name || localState.displayName, createdAtMs });
-          } catch (e) { localState.peerMeta.set(pid, { name: data.name || localState.displayName, createdAtMs: Date.now() }); }
+        if (pid === localState.peerId) return; // skip self
+        // If the peer is stale now, skip
+        const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
+        if (Date.now() - lastSeenMs > PRESENCE_TIMEOUT_MS) {
+          console.log('Skipping stale added peer', pid);
           return;
         }
+
         setStatus(`Peer joined: ${pid}`);
         addRemoteTile(pid, data.name || 'Participant');
-        try {
-          const createdAtMs = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : (data.createdAt || Date.now());
-          localState.peerMeta.set(pid, { name: data.name || 'Participant', createdAtMs });
-        } catch (e) { localState.peerMeta.set(pid, { name: data.name || 'Participant', createdAtMs: Date.now() }); }
 
         if (!localState.pcMap.has(pid)) {
           createAndSendOffer(roomId, pid).catch(err => console.error(err));
@@ -451,13 +501,9 @@ function startListeningToPeers(roomId) {
       } else if (change.type === 'modified') {
         const tileName = document.querySelector(`#tile-${pid} .name`);
         if (tileName && data.name) tileName.textContent = data.name;
-        try {
-          const createdAtMs = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : (data.createdAt || Date.now());
-          const prev = localState.peerMeta.get(pid) || {};
-          localState.peerMeta.set(pid, { name: data.name || prev.name || 'Participant', createdAtMs });
-        } catch (e) {}
       }
     });
+
     updateParticipantsClass();
   }, err => console.error('Peers snapshot error', err));
   localState.unsubscribers.push(unsub);
@@ -478,16 +524,18 @@ function startListeningToMessages(roomId) {
 }
 
 /* ======================
-   11) Join / Leave flows (with polling start/stop)
+   11) Join / Leave flows (with heartbeat start/stop)
    ====================== */
 
 async function joinRoom(roomIdInput) {
   const roomId = (roomIdInput && String(roomIdInput).trim()) || (window.location.hash ? window.location.hash.replace('#','') : '');
-  if (!roomId) { setStatus('Masukkan Room ID sebelum join'); return; }
+  if (!roomId) { setStatus('Please enter a Room ID before joining'); return; }
+
   localState.roomId = roomId;
   localState.peerId = genId('p-');
   const dn = el.displayNameInput && el.displayNameInput.value;
   if (dn && dn.trim()) localState.displayName = dn.trim();
+
   setStatus(`Joining ${roomId} as ${localState.peerId} (${localState.displayName})`);
 
   try {
@@ -496,20 +544,29 @@ async function joinRoom(roomIdInput) {
 
   try { await ensureLocalStream(); } catch (e) { console.warn('Continue without local media'); }
 
+  // write presence (initial)
   try {
     await writePeerPresence(roomId, localState.peerId, { name: localState.displayName });
-  } catch (err) { console.error('Failed to write presence', err); setStatus('Gagal bergabung (Firestore).'); return; }
+  } catch (err) { console.error('Failed to write presence', err); setStatus('Failed to join (Firestore).'); return; }
 
+  // listeners
   startListeningToPeers(roomId);
   startListeningToSignals(roomId);
   startListeningToMessages(roomId);
 
+  // fetch existing peers & only create offers for peers that are NOT stale
   try {
     const peersSnap = await getDocs(peersCollectionRef(roomId));
     peersSnap.forEach(docSnap => {
       const data = docSnap.data();
       const pid = data.peerId || docSnap.id;
-      if (pid !== localState.peerId && !localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e=>console.error(e));
+      if (pid === localState.peerId) return;
+      const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
+      if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) {
+        if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e => console.error(e));
+      } else {
+        console.log('Skipping stale peer at join:', pid);
+      }
     });
   } catch (e) { console.warn('Could not fetch peers upfront', e); }
 
@@ -517,32 +574,47 @@ async function joinRoom(roomIdInput) {
   if (el.createRoomBtn) el.createRoomBtn.disabled = true;
   setStatus(`Joined room ${roomId}. Waiting for peers...`);
 
-  // start polling video state for auto-hide logic
+  // start presence heartbeat + video polling
+  startPresenceHeartbeat();
   startVideoStatePolling();
 
   try { window.location.hash = roomId; } catch(e){}
 }
 
-async function leaveRoom() {
+async function leaveRoom(isAuto = false) {
   const roomId = localState.roomId;
   setStatus('Leaving room...');
   for (const [peerId, pc] of localState.pcMap.entries()) { try { pc.close(); } catch(e){} }
   localState.pcMap.clear(); localState.dcMap.clear();
 
+  // stop heartbeat & polling early
+  stopPresenceHeartbeat();
+  stopVideoStatePolling();
+
   if (roomId && localState.peerId) {
-    try { await removePeerPresence(roomId, localState.peerId); } catch(e) { console.warn(e); }
+    try {
+      // best-effort: set online:false first (merge), then delete doc
+      try {
+        await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true });
+      } catch (err) { /* continue */ }
+      // attempt delete (may fail on unload, but try)
+      await removePeerPresence(roomId, localState.peerId);
+    } catch(e) { console.warn('Could not remove presence during leave', e); }
   }
+
+  // unsubscribe snapshots
   localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e){} });
   localState.unsubscribers = [];
 
-  stopVideoStatePolling();
-
+  // clear UI tiles
   const tiles = Array.from(el.videos.querySelectorAll('.vid'));
   tiles.forEach(t => t.remove());
 
+  // stop local media
   if (localState.localStream) { localState.localStream.getTracks().forEach(t => t.stop()); localState.localStream = null; }
   if (localState.screenStream) { localState.screenStream.getTracks().forEach(t => t.stop()); localState.screenStream = null; }
 
+  // reset state
   localState.roomId = null; localState.peerId = null; localState.remoteStreams.clear();
   localState.peerMeta.clear();
 
@@ -552,19 +624,63 @@ async function leaveRoom() {
   updateParticipantsClass();
 }
 
-/* ensure polling stopped on unload and presence removed */
-window.addEventListener('beforeunload', async () => {
+/* ensure presence cleanup on unload & visibility changes (best-effort) */
+async function tryCleanupOnUnload() {
   stopVideoStatePolling();
-  try { if (localState.roomId && localState.peerId) await removePeerPresence(localState.roomId, localState.peerId); } catch(e){}
+  stopPresenceHeartbeat();
+
+  try {
+    if (localState.roomId && localState.peerId) {
+      // attempt to mark offline & delete presence (best-effort)
+      try {
+        await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true });
+      } catch (e) { /* ignore */ }
+      try {
+        await removePeerPresence(localState.roomId, localState.peerId);
+      } catch (e) { /* ignore */ }
+    }
+  } catch (err) {
+    // ignore errors on unload
+  }
+
   if (localState.localStream) localState.localStream.getTracks().forEach(t=>t.stop());
   if (localState.screenStream) localState.screenStream.getTracks().forEach(t=>t.stop());
+}
+
+// Use beforeunload to attempt synchronous cleanup (best-effort)
+window.addEventListener('beforeunload', (ev) => {
+  // Fire-and-forget cleanup (can't reliably await here)
+  tryCleanupOnUnload();
+  // give the browser a hint it's okay to unload
+});
+
+// also attempt when page hidden (mobile browser closing)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    tryCleanupOnUnload();
+  }
 });
 
 /* ======================
-   12) Screen share (same behavior)
+   12) Presence heartbeat
+   ====================== */
+function startPresenceHeartbeat() {
+  if (localState._presenceHeartbeatInterval) return;
+  // immediately touch once
+  touchPeerPresence().catch(()=>{});
+  localState._presenceHeartbeatInterval = setInterval(() => {
+    touchPeerPresence().catch(()=>{});
+  }, PRESENCE_HEARTBEAT_MS);
+}
+function stopPresenceHeartbeat() {
+  if (localState._presenceHeartbeatInterval) { clearInterval(localState._presenceHeartbeatInterval); localState._presenceHeartbeatInterval = null; }
+}
+
+/* ======================
+   13) Screen share
    ====================== */
 async function startScreenShare() {
-  if (!navigator.mediaDevices.getDisplayMedia) { setStatus('Screen share tidak didukung'); return; }
+  if (!navigator.mediaDevices.getDisplayMedia) { setStatus('Screen share not supported in this browser'); return; }
   try {
     const screenStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:false });
     localState.screenStream = screenStream;
@@ -594,17 +710,17 @@ async function startScreenShare() {
     });
 
     setStatus('You are sharing your screen');
-  } catch (err) { console.error(err); setStatus('Gagal membagikan layar'); }
+  } catch (err) { console.error(err); setStatus('Failed to share screen'); }
 }
 
 /* ======================
-   13) Chat wiring
+   14) Chat wiring
    ====================== */
 if (el.chatForm) {
   el.chatForm.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const text = el.chatInput.value || '';
-    if (!localState.roomId) { setStatus('Belum join room — chat tidak terkirim'); return; }
+    if (!localState.roomId) { setStatus('Not in a room — chat not sent'); return; }
     await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text);
     appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self:true });
     el.chatInput.value = '';
@@ -613,7 +729,7 @@ if (el.chatForm) {
 }
 
 /* ======================
-   14) Controls wiring
+   15) Controls wiring
    ====================== */
 if (el.createRoomBtn) el.createRoomBtn.addEventListener('click', ()=> joinRoom(el.roomIdInput.value.trim()).catch(console.error));
 if (el.leaveRoomBtn) el.leaveRoomBtn.addEventListener('click', ()=> leaveRoom().catch(console.error));
@@ -634,7 +750,7 @@ if (el.displayNameInput) el.displayNameInput.addEventListener('change', async ()
 });
 
 /* ======================
-   15) Initial preview attempt
+   16) Initial preview attempt
    ====================== */
 (async function tryInitPreview(){
   try {
@@ -646,9 +762,11 @@ if (el.displayNameInput) el.displayNameInput.addEventListener('change', async ()
 })();
 
 /* ======================
-   16) Fit & layout helpers
-   - fitVideosToViewport() and layoutVideoGrid()
+   17) Fit & layout helpers
    ====================== */
+// (layoutVideoGrid / fitVideosToViewport unchanged from earlier — omitted here if needed, or keep your existing functions)
+// Copy paste existing fitVideosToViewport() and layoutVideoGrid() functions here (unchanged).
+// For brevity I'm leaving them as-is; they are present in your previous file and are compatible.
 
 function fitVideosToViewport() {
   try {
@@ -735,8 +853,7 @@ window.addEventListener('resize', ()=>{ fitVideosToViewport(); layoutVideoGrid()
 window.addEventListener('orientationchange', ()=>{ setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
 
 /* ======================
-   17) Visibility rules: hide extras (>maxVisible)
-   - Prioritize: local -> cam-on -> older join time
+   18) Visibility rules & polling (unchanged)
    ====================== */
 
 function applyVisibilityRules(maxVisible = 4) {
@@ -747,7 +864,7 @@ function applyVisibilityRules(maxVisible = 4) {
     const total = tiles.length;
     if (total <= maxVisible) {
       tiles.forEach(t => { t.classList.remove('hidden-by-limit'); t.style.display=''; t.setAttribute('aria-hidden','false'); });
-      setStatus(`${total} peserta`);
+      setStatus(`${total} participants`);
       layoutVideoGrid();
       return;
     }
@@ -781,12 +898,11 @@ function applyVisibilityRules(maxVisible = 4) {
     });
 
     const hiddenCount = total - visiblePeers.size;
-    setStatus(`${total} peserta • ${hiddenCount} disembunyikan`);
+    setStatus(`${total} participants • ${hiddenCount} hidden`);
     layoutVideoGrid();
   } catch (err) { console.warn('applyVisibilityRules error', err); }
 }
 
-/* Polling to detect camera on/off changes (lightweight) */
 function detectVideoStateAndApply(maxVisible = 4) {
   try {
     const videosEl = document.querySelector('.videos');
@@ -818,7 +934,7 @@ function stopVideoStatePolling() {
 }
 
 /* ======================
-   18) Keyboard shortcuts & debug
+   19) Keyboard shortcuts & debug
    ====================== */
 window.addEventListener('keydown', (ev) => {
   if ((ev.ctrlKey || ev.metaKey) && ev.key === 'm') { ev.preventDefault(); if (localState.localStream) setMicEnabled(!localState.localStream.getAudioTracks().some(t=>t.enabled)); }
