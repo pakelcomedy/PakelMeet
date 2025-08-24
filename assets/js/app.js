@@ -1,9 +1,9 @@
 /* =========================================================================
-   PakelMeet — assets/js/app.js (PRESENCE-HEARTBEAT + AUTO-LEAVE FIX)
+   PakelMeet — assets/js/app.js (LATEST)
    - Full WebRTC mesh with Firestore signaling & chat
-   - Presence heartbeat: updates presence.lastSeen periodically
-   - Peers automatically considered "left" when lastSeen is stale
-   - Best-effort removal on beforeunload / visibilitychange
+   - Presence heartbeat + auto-cleanup on unload
+   - Auto-join from URL hash and hide room controls when auto-joined
+   - Auto-hide extra participants when >4 (prioritize cam-on)
    ========================================================================= */
 
 /* ======================
@@ -19,7 +19,8 @@ import {
 } from 'https://www.gstatic.com/firebasejs/9.22.2/firebase-auth.js';
 
 /* ======================
-   2) FIREBASE CONFIG (already provided)
+   2) FIREBASE CONFIG
+   (use your project config)
    ====================== */
 const firebaseConfig = {
   apiKey: "AIzaSyD4sr-HM_KbDf9gJ-o4N8vywUqRERTPeVY",
@@ -41,12 +42,12 @@ signInAnonymously(auth).catch(err => console.error("Firebase anon sign-in failed
 onAuthStateChanged(auth, user => { currentUser = user; console.log("Auth:", user ? "anon" : "signed out"); });
 
 /* ======================
-   3) App state & presence constants
+   3) App state & constants
    ====================== */
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
-const PRESENCE_HEARTBEAT_MS = 5000;      // update our presence every 5s
-const PRESENCE_TIMEOUT_MS = 15000;       // consider peer offline if lastSeen older than 15s
+const PRESENCE_HEARTBEAT_MS = 5000;      // update presence every 5s
+const PRESENCE_TIMEOUT_MS = 15000;       // treat peer offline if lastSeen older than 15s
 
 const localState = {
   roomId: null,
@@ -59,9 +60,10 @@ const localState = {
   screenStream: null,
   unsubscribers: [],
   listeners: {},
-  peerMeta: new Map(),            // peerId -> { name, createdAtMs, lastSeenMs, online }
-  _videoDetectInterval: null,     // polling interval id
+  peerMeta: new Map(),            // peerId -> metadata
+  _videoDetectInterval: null,
   _presenceHeartbeatInterval: null,
+  _autoJoinedFromHash: false,     // *new*: whether this client auto-joined from hash
 };
 
 /* ======================
@@ -70,6 +72,7 @@ const localState = {
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const el = {
+  roomControlsSection: $('#room-controls'),
   roomForm: $('#roomForm'),
   roomIdInput: $('#roomId'),
   createRoomBtn: $('#createRoom'),
@@ -113,7 +116,6 @@ const appendLogToChat = (m={name:'', text:'', ts:Date.now(), self:false}) => {
   el.chatBox.scrollTop = el.chatBox.scrollHeight;
 };
 
-/* helper to detect if a MediaStream has an enabled video track */
 function hasActiveVideoFromStream(stream) {
   try {
     if (!stream) return false;
@@ -123,9 +125,8 @@ function hasActiveVideoFromStream(stream) {
 }
 
 /* ======================
-   6) UI helpers: tiles
+   6) UI helpers (tiles)
    ====================== */
-
 function createLocalTile(stream) {
   const tpl = document.querySelector('#video-tile-template');
   const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : safeCreateElem('div', { class: 'vid' });
@@ -142,9 +143,7 @@ function createLocalTile(stream) {
   nameEl.textContent = localState.displayName || 'Me';
   if (!container.contains(nameEl)) container.appendChild(nameEl);
 
-  // mark initial video presence flag
   container.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
-
   el.videos.prepend(container);
   updateParticipantsClass();
   return container;
@@ -165,7 +164,7 @@ function addRemoteTile(peerId, name='Participant') {
   nameEl.textContent = name || 'Participant';
   if (!container.contains(nameEl)) container.appendChild(nameEl);
 
-  container.dataset._hasvideo = 'false'; // will be updated when stream arrives
+  container.dataset._hasvideo = 'false';
   el.videos.appendChild(container);
   updateParticipantsClass();
   return container;
@@ -177,7 +176,6 @@ function setRemoteStreamOnTile(peerId, stream) {
   const videoEl = tile.querySelector('video');
   if (videoEl) {
     videoEl.srcObject = stream;
-    // mark dataset for polling logic
     tile.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
   }
   localState.remoteStreams.set(peerId, stream);
@@ -192,7 +190,6 @@ function removeTile(peerId) {
   updateParticipantsClass();
 }
 
-/* Update participants class counts and then enforce visibility/layout */
 function updateParticipantsClass() {
   const tiles = el.videos ? el.videos.querySelectorAll('.vid') : [];
   const count = tiles ? tiles.length : 0;
@@ -202,10 +199,7 @@ function updateParticipantsClass() {
   const capped = Math.min(Math.max(count, 1), 9);
   container.classList.add(`participants-${capped}`);
 
-  // Enforce visibility rules (max 4 visible)
   applyVisibilityRules(4);
-
-  // Recalculate layout / fit to viewport
   if (typeof layoutVideoGrid === 'function') layoutVideoGrid();
   if (typeof fitVideosToViewport === 'function') fitVideosToViewport();
 }
@@ -228,7 +222,6 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
   }
 }
 
-/* Toggle helpers */
 function setMicEnabled(enabled) {
   if (!localState.localStream) return;
   localState.localStream.getAudioTracks().forEach(t => t.enabled = !!enabled);
@@ -244,13 +237,12 @@ function setCamEnabled(enabled) {
     el.toggleCamBtn.setAttribute('aria-pressed', String(!enabled));
     el.toggleCamBtn.textContent = enabled ? '🎥 Cam' : '🚫 Cam';
   }
-  // update our local tile flag immediately
   const localTile = document.querySelector(`#tile-${localState.peerId}`);
   if (localTile) localTile.dataset._hasvideo = enabled ? 'true' : 'false';
 }
 
 /* ======================
-   8) Firestore helpers (presence now includes lastSeen)
+   8) Firestore helpers (presence includes lastSeen)
    ====================== */
 function roomDocRef(roomId){ return doc(db, 'rooms', roomId); }
 function peersCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'peers'); }
@@ -266,43 +258,28 @@ async function writePeerPresence(roomId, peerId, meta={}) {
     peerId,
     online: true,
   };
-  // write/overwrite presence doc
   await setDoc(peerRef, payload, { merge: true });
 }
 
-// update lastSeen periodically (heartbeat)
 async function touchPeerPresence() {
   if (!localState.roomId || !localState.peerId) return;
   const peerRef = doc(db, 'rooms', localState.roomId, 'peers', localState.peerId);
   try {
-    // set only lastSeen and online (merge)
     await setDoc(peerRef, { lastSeen: serverTimestamp ? serverTimestamp() : new Date(), online: true }, { merge: true });
-  } catch (err) {
-    console.warn('touchPeerPresence failed', err);
-  }
+  } catch (err) { console.warn('touchPeerPresence failed', err); }
 }
 
-// best-effort remove presence (called on leave/unload)
 async function removePeerPresence(roomId, peerId) {
   const peerRef = doc(db, 'rooms', roomId, 'peers', peerId);
-  try {
-    await deleteDoc(peerRef);
-  } catch (err) {
-    console.warn("Failed to remove presence doc (it might be already removed):", err);
-  }
+  try { await deleteDoc(peerRef); } catch(e){ /*ignore*/ }
 }
 
 async function sendSignal(roomId, message) {
-  try {
-    await addDoc(signalsCollectionRef(roomId), { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() });
-  } catch (err) { console.error("Failed to send signal", err); }
+  try { await addDoc(signalsCollectionRef(roomId), { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() }); } catch (err) { console.error("Failed to send signal", err); }
 }
-
 async function sendChatMessage(roomId, name, text) {
   if (!text || !text.trim()) return;
-  try {
-    await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null });
-  } catch (err) { console.error("Failed to send chat message", err); }
+  try { await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null }); } catch (err) { console.error("Failed to send chat message", err); }
 }
 
 /* ======================
@@ -314,12 +291,8 @@ function makeNewPeerConnection(peerId, isOfferer=false) {
   const remoteStream = new MediaStream();
   localState.remoteStreams.set(peerId, remoteStream);
 
-  if (localState.localStream) {
-    localState.localStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.localStream); } catch(e) {} });
-  }
-  if (localState.screenStream) {
-    localState.screenStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.screenStream); } catch(e) {} });
-  }
+  if (localState.localStream) localState.localStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.localStream); } catch(e) {} });
+  if (localState.screenStream) localState.screenStream.getTracks().forEach(track => { try { pc.addTrack(track, localState.screenStream); } catch(e) {} });
 
   pc.addEventListener('track', (evt) => {
     if (evt.streams && evt.streams[0]) {
@@ -334,18 +307,13 @@ function makeNewPeerConnection(peerId, isOfferer=false) {
   });
 
   pc.addEventListener('datachannel', (evt) => setupDataChannelHandlers(peerId, evt.channel));
-
   pc.addEventListener('icecandidate', async (evt) => {
     if (!evt.candidate) return;
     await sendSignal(localState.roomId, { type:'ice', from: localState.peerId, to: peerId, payload: evt.candidate.toJSON ? evt.candidate.toJSON() : evt.candidate });
   });
-
-  pc.addEventListener('connectionstatechange', () => {
-    console.log('pc state', peerId, pc.connectionState);
-  });
+  pc.addEventListener('connectionstatechange', () => console.log('pc state', peerId, pc.connectionState));
 
   localState.pcMap.set(peerId, pc);
-
   if (isOfferer) {
     try {
       const dc = pc.createDataChannel('p2p-chat');
@@ -370,7 +338,6 @@ function setupDataChannelHandlers(peerId, dc) {
   };
 }
 
-/* Offer/answer/ice handlers */
 async function createAndSendOffer(roomId, toPeerId) {
   setStatus(`Creating offer for ${toPeerId}...`);
   const pc = makeNewPeerConnection(toPeerId, true);
@@ -414,10 +381,8 @@ async function handleIncomingIce(message) {
 }
 
 /* ======================
-   10) Firestore listeners (peers/signals/messages)
-   - presence-aware: ignore or remove stale peers
+   10) Firestore listeners
    ====================== */
-
 function startListeningToSignals(roomId) {
   const q = query(signalsCollectionRef(roomId), orderBy('ts'));
   const unsub = onSnapshot(q, (snapshot) => {
@@ -442,54 +407,28 @@ function startListeningToPeers(roomId) {
   const q = query(peersCollectionRef(roomId));
   const unsub = onSnapshot(q, (snapshot) => {
     const nowMs = Date.now();
+
+    // Update metadata map for all docs first
     snapshot.docs.forEach(docSnap => {
       const data = docSnap.data();
       const pid = data.peerId || docSnap.id;
-      // convert timestamps to ms if Firestore Timestamp
       const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
-      const onlineFlag = data.online === undefined ? true : !!data.online;
       const createdAtMs = (data.createdAt && data.createdAt.toMillis) ? data.createdAt.toMillis() : (data.createdAt || nowMs);
-
-      // store metadata
+      const onlineFlag = data.online === undefined ? true : !!data.online;
       localState.peerMeta.set(pid, { name: data.name || 'Participant', createdAtMs, lastSeenMs, online: onlineFlag });
-
-      // If this doc is stale (no recent heartbeat), treat as offline locally
-      const stale = (nowMs - lastSeenMs) > PRESENCE_TIMEOUT_MS;
-      if (stale || !onlineFlag) {
-        // if it's our doc and stale, ignore; if it's another peer and stale -> cleanup
-        if (pid !== localState.peerId) {
-          // close PC if exists
-          const pc = localState.pcMap.get(pid);
-          if (pc) { try { pc.close(); } catch(e) {} localState.pcMap.delete(pid); }
-          // remove tile/UI
-          removeTile(pid);
-          localState.remoteStreams.delete(pid);
-          localState.dcMap.delete(pid);
-          localState.peerMeta.delete(pid);
-          return; // skip creating offers to stale peers
-        }
-      }
     });
 
-    // Process docChanges to detect added/removed/modified using conventional flow
+    // Handle changes (added/modified/removed)
     snapshot.docChanges().forEach(change => {
       const data = change.doc.data();
       const pid = data.peerId || change.doc.id;
       if (change.type === 'added') {
-        if (pid === localState.peerId) return; // skip self
-        // If the peer is stale now, skip
+        if (pid === localState.peerId) return;
         const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
-        if (Date.now() - lastSeenMs > PRESENCE_TIMEOUT_MS) {
-          console.log('Skipping stale added peer', pid);
-          return;
-        }
-
+        if (Date.now() - lastSeenMs > PRESENCE_TIMEOUT_MS) { console.log('Skipping stale added peer', pid); return; }
         setStatus(`Peer joined: ${pid}`);
         addRemoteTile(pid, data.name || 'Participant');
-
-        if (!localState.pcMap.has(pid)) {
-          createAndSendOffer(roomId, pid).catch(err => console.error(err));
-        }
+        if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(err=>console.error(err));
       } else if (change.type === 'removed') {
         setStatus(`Peer left: ${pid}`);
         const pc = localState.pcMap.get(pid);
@@ -503,6 +442,21 @@ function startListeningToPeers(roomId) {
         if (tileName && data.name) tileName.textContent = data.name;
       }
     });
+
+    // Remove stale peers proactively: if a peer doc hasn't had heartbeat within timeout, treat as gone
+    for (const [pid, meta] of Array.from(localState.peerMeta.entries())) {
+      if (pid === localState.peerId) continue;
+      const lastSeen = meta.lastSeenMs || meta.lastSeen || 0;
+      if ((Date.now() - (lastSeen || Date.now())) > PRESENCE_TIMEOUT_MS) {
+        // stale
+        const pc = localState.pcMap.get(pid);
+        if (pc) { try { pc.close(); } catch(e) {} localState.pcMap.delete(pid); }
+        removeTile(pid);
+        localState.peerMeta.delete(pid);
+        localState.remoteStreams.delete(pid);
+        localState.dcMap.delete(pid);
+      }
+    }
 
     updateParticipantsClass();
   }, err => console.error('Peers snapshot error', err));
@@ -524,9 +478,8 @@ function startListeningToMessages(roomId) {
 }
 
 /* ======================
-   11) Join / Leave flows (with heartbeat start/stop)
+   11) Join / Leave (auto-join + hide room-controls)
    ====================== */
-
 async function joinRoom(roomIdInput) {
   const roomId = (roomIdInput && String(roomIdInput).trim()) || (window.location.hash ? window.location.hash.replace('#','') : '');
   if (!roomId) { setStatus('Please enter a Room ID before joining'); return; }
@@ -544,17 +497,13 @@ async function joinRoom(roomIdInput) {
 
   try { await ensureLocalStream(); } catch (e) { console.warn('Continue without local media'); }
 
-  // write presence (initial)
-  try {
-    await writePeerPresence(roomId, localState.peerId, { name: localState.displayName });
-  } catch (err) { console.error('Failed to write presence', err); setStatus('Failed to join (Firestore).'); return; }
+  try { await writePeerPresence(roomId, localState.peerId, { name: localState.displayName }); } catch (err) { console.error('Failed to write presence', err); setStatus('Failed to join (Firestore).'); return; }
 
-  // listeners
   startListeningToPeers(roomId);
   startListeningToSignals(roomId);
   startListeningToMessages(roomId);
 
-  // fetch existing peers & only create offers for peers that are NOT stale
+  // proactive existing peers -> only to non-stale
   try {
     const peersSnap = await getDocs(peersCollectionRef(roomId));
     peersSnap.forEach(docSnap => {
@@ -563,7 +512,7 @@ async function joinRoom(roomIdInput) {
       if (pid === localState.peerId) return;
       const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
       if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) {
-        if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e => console.error(e));
+        if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e=>console.error(e));
       } else {
         console.log('Skipping stale peer at join:', pid);
       }
@@ -574,103 +523,83 @@ async function joinRoom(roomIdInput) {
   if (el.createRoomBtn) el.createRoomBtn.disabled = true;
   setStatus(`Joined room ${roomId}. Waiting for peers...`);
 
-  // start presence heartbeat + video polling
   startPresenceHeartbeat();
   startVideoStatePolling();
+
+  // If this join is triggered by auto-join-from-hash, hide room-controls
+  if (localState._autoJoinedFromHash && el.roomControlsSection) {
+    try {
+      el.roomControlsSection.style.display = 'none';
+      // optionally hide shareUrl as it's inside the section; if you want shareUrl visible elsewhere, adapt here
+    } catch(e){}
+  }
 
   try { window.location.hash = roomId; } catch(e){}
 }
 
-async function leaveRoom(isAuto = false) {
+async function leaveRoom() {
   const roomId = localState.roomId;
   setStatus('Leaving room...');
   for (const [peerId, pc] of localState.pcMap.entries()) { try { pc.close(); } catch(e){} }
   localState.pcMap.clear(); localState.dcMap.clear();
 
-  // stop heartbeat & polling early
   stopPresenceHeartbeat();
   stopVideoStatePolling();
 
   if (roomId && localState.peerId) {
     try {
-      // best-effort: set online:false first (merge), then delete doc
-      try {
-        await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true });
-      } catch (err) { /* continue */ }
-      // attempt delete (may fail on unload, but try)
+      try { await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true }); } catch(e){}
       await removePeerPresence(roomId, localState.peerId);
     } catch(e) { console.warn('Could not remove presence during leave', e); }
   }
 
-  // unsubscribe snapshots
   localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e){} });
   localState.unsubscribers = [];
 
-  // clear UI tiles
   const tiles = Array.from(el.videos.querySelectorAll('.vid'));
   tiles.forEach(t => t.remove());
 
-  // stop local media
   if (localState.localStream) { localState.localStream.getTracks().forEach(t => t.stop()); localState.localStream = null; }
   if (localState.screenStream) { localState.screenStream.getTracks().forEach(t => t.stop()); localState.screenStream = null; }
 
-  // reset state
-  localState.roomId = null; localState.peerId = null; localState.remoteStreams.clear();
-  localState.peerMeta.clear();
+  localState.roomId = null; localState.peerId = null; localState.remoteStreams.clear(); localState.peerMeta.clear();
 
   if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = true;
   if (el.createRoomBtn) el.createRoomBtn.disabled = false;
   setStatus('Left room');
+
+  // If we had auto-joined and hid room-controls, restore visibility on explicit leave
+  if (localState._autoJoinedFromHash && el.roomControlsSection) {
+    try { el.roomControlsSection.style.display = ''; localState._autoJoinedFromHash = false; } catch(e){}
+  }
+
   updateParticipantsClass();
 }
 
-/* ensure presence cleanup on unload & visibility changes (best-effort) */
+/* Unload/visibility cleanup (best-effort) */
 async function tryCleanupOnUnload() {
   stopVideoStatePolling();
   stopPresenceHeartbeat();
-
   try {
     if (localState.roomId && localState.peerId) {
-      // attempt to mark offline & delete presence (best-effort)
-      try {
-        await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true });
-      } catch (e) { /* ignore */ }
-      try {
-        await removePeerPresence(localState.roomId, localState.peerId);
-      } catch (e) { /* ignore */ }
+      try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true }); } catch(e){}
+      try { await removePeerPresence(localState.roomId, localState.peerId); } catch(e){}
     }
-  } catch (err) {
-    // ignore errors on unload
-  }
-
+  } catch (err) {}
   if (localState.localStream) localState.localStream.getTracks().forEach(t=>t.stop());
   if (localState.screenStream) localState.screenStream.getTracks().forEach(t=>t.stop());
 }
 
-// Use beforeunload to attempt synchronous cleanup (best-effort)
-window.addEventListener('beforeunload', (ev) => {
-  // Fire-and-forget cleanup (can't reliably await here)
-  tryCleanupOnUnload();
-  // give the browser a hint it's okay to unload
-});
-
-// also attempt when page hidden (mobile browser closing)
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') {
-    tryCleanupOnUnload();
-  }
-});
+window.addEventListener('beforeunload', () => { tryCleanupOnUnload(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') tryCleanupOnUnload(); });
 
 /* ======================
    12) Presence heartbeat
    ====================== */
 function startPresenceHeartbeat() {
   if (localState._presenceHeartbeatInterval) return;
-  // immediately touch once
   touchPeerPresence().catch(()=>{});
-  localState._presenceHeartbeatInterval = setInterval(() => {
-    touchPeerPresence().catch(()=>{});
-  }, PRESENCE_HEARTBEAT_MS);
+  localState._presenceHeartbeatInterval = setInterval(() => { touchPeerPresence().catch(()=>{}); }, PRESENCE_HEARTBEAT_MS);
 }
 function stopPresenceHeartbeat() {
   if (localState._presenceHeartbeatInterval) { clearInterval(localState._presenceHeartbeatInterval); localState._presenceHeartbeatInterval = null; }
@@ -688,14 +617,12 @@ async function startScreenShare() {
     addRemoteTile(screenTileId, `${localState.displayName} (screen)`);
     const videoEl = document.querySelector(`#tile-${screenTileId} video`);
     if (videoEl) videoEl.srcObject = screenStream;
-
     for (const [peerId, pc] of localState.pcMap.entries()) {
       const senders = pc.getSenders().filter(s => s.track && s.track.kind === 'video');
       if (senders.length > 0) {
         try { await senders[0].replaceTrack(screenStream.getVideoTracks()[0]); } catch(e){ try{ pc.addTrack(screenStream.getVideoTracks()[0], screenStream); }catch(e){} }
       } else { try{ pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e) {} }
     }
-
     screenStream.getVideoTracks()[0].addEventListener('ended', async () => {
       removeTile(screenTileId);
       if (localState.localStream && localState.localStream.getVideoTracks().length > 0) {
@@ -708,7 +635,6 @@ async function startScreenShare() {
       }
       localState.screenStream = null;
     });
-
     setStatus('You are sharing your screen');
   } catch (err) { console.error(err); setStatus('Failed to share screen'); }
 }
@@ -762,11 +688,11 @@ if (el.displayNameInput) el.displayNameInput.addEventListener('change', async ()
 })();
 
 /* ======================
-   17) Fit & layout helpers
+   17) Fit & layout helpers (reuse your previously working functions)
    ====================== */
-// (layoutVideoGrid / fitVideosToViewport unchanged from earlier — omitted here if needed, or keep your existing functions)
-// Copy paste existing fitVideosToViewport() and layoutVideoGrid() functions here (unchanged).
-// For brevity I'm leaving them as-is; they are present in your previous file and are compatible.
+/* Keep the fitVideosToViewport() & layoutVideoGrid() implementations from your previous file.
+   For brevity they're not duplicated here in full; ensure the functions exist in your file
+   (they were present in earlier versions you shared). */
 
 function fitVideosToViewport() {
   try {
@@ -842,7 +768,6 @@ function layoutVideoGrid() {
     tiles.forEach(t => { t.style.height = `${tileHpx}px`; });
 
     videosEl.style.overflowY = best.fits ? 'hidden' : 'auto';
-
     const statusEl = document.querySelector('#status');
     if (statusEl) statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${best.rows} • ${best.fits ? 'fit' : 'scroll'}`;
   } catch (err) { console.warn('layoutVideoGrid error', err); }
@@ -853,9 +778,8 @@ window.addEventListener('resize', ()=>{ fitVideosToViewport(); layoutVideoGrid()
 window.addEventListener('orientationchange', ()=>{ setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
 
 /* ======================
-   18) Visibility rules & polling (unchanged)
+   18) Visibility rules & polling
    ====================== */
-
 function applyVisibilityRules(maxVisible = 4) {
   try {
     const videosEl = document.querySelector('.videos');
@@ -943,4 +867,32 @@ window.addEventListener('keydown', (ev) => {
 
 window._pakelmeet = { localState, joinRoom, leaveRoom, setStatus, sendChatMessage, applyVisibilityRules, layoutVideoGrid };
 
-/* End of file */
+/* ======================
+   20) AUTO-JOIN ON HASH (executed at bottom)
+   - If a hash exists, fill input, set auto-join flag, and call joinRoom()
+   ====================== */
+
+function tryAutoJoinFromHash() {
+  try {
+    const raw = window.location.hash ? window.location.hash.replace('#','').trim() : '';
+    if (!raw) return;
+    // populate input (so user sees ID briefly if controls are visible)
+    if (el.roomIdInput) el.roomIdInput.value = raw;
+    // mark auto-join flag so joinRoom hides room controls after joining
+    localState._autoJoinedFromHash = true;
+    // small delay (let page settle / preview init) then join
+    setTimeout(() => {
+      joinRoom(raw).catch(err => {
+        console.error('Auto-join failed', err);
+        // in case of failure, restore auto-join flag so user can try manually
+        localState._autoJoinedFromHash = false;
+      });
+    }, 250);
+  } catch (err) { console.warn('tryAutoJoinFromHash error', err); }
+}
+
+/* Call auto-join on initial load (after a short wait to allow preview attempts) */
+window.addEventListener('load', () => {
+  setTimeout(() => tryAutoJoinFromHash(), 300);
+});
+
