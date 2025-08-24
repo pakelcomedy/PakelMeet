@@ -1,10 +1,11 @@
 /* ==========================================================
   PakelMeet — assets/js/app.js (FIXED & PRODUCTION-READY)
-  - Complete WebRTC mesh with Firestore signaling & chat
+  - Full WebRTC mesh with Firestore signaling & chat
   - Presence heartbeat + best-effort unload cleanup
   - Auto-join from URL hash (hides room controls when auto-joined)
   - Visibility rules: show at most N tiles (default 4)
-  - Responsive layout + camera on/off detection
+  - Auto-assign display names: "Participant 1", "Participant 2", ...
+  - Auto-clean Firestore room data when last user leaves (best-effort)
 
   Usage: <script type="module" src="/assets/js/app.js" defer></script>
   NOTE: Replace firebaseConfig with your own project credentials if desired.
@@ -68,7 +69,6 @@ const localState = {
   _presenceHeartbeatInterval: null,
   _autoJoinedFromHash: false,
   _joined: false,
-  // Option: if you want to remove the hash after successful auto-join, set to true
   _removeHashAfterAutoJoin: false,
 };
 
@@ -210,15 +210,75 @@ function updateParticipantsClass() {
 /* ======================
    7) Local media
    ====================== */
-async function ensureLocalStream(constraints = { audio:true, video:{ width: { ideal:1280 }, height: { ideal:720 } } }) {
+async function ensureLocalStream(constraints = { audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } }) {
+  // If we already have a localStream, return it
   if (localState.localStream) return localState.localStream;
+
+  // Helper to normalize video constraints object
+  const baseVideo = (constraints && typeof constraints.video === 'object') ? { ...constraints.video } : {};
+
+  // Try strategies in order:
+  // 1) exact facingMode: 'user' (may throw if device doesn't support exact)
+  // 2) ideal facingMode: 'user'
+  // 3) fallback to the provided constraints (or default)
+  const exactFront = { audio: !!constraints.audio, video: { ...baseVideo, facingMode: { exact: 'user' } } };
+  const idealFront = { audio: !!constraints.audio, video: { ...baseVideo, facingMode: { ideal: 'user' } } };
+  const fallback = { audio: !!constraints.audio, video: (Object.keys(baseVideo).length ? baseVideo : true) };
+
+  let stream = null;
   try {
-    const s = await navigator.mediaDevices.getUserMedia(constraints);
-    localState.localStream = s; createLocalTile(s); setStatus('Local media active'); return s;
-  } catch (err) { console.warn('getUserMedia failed', err); setStatus('No camera/mic — continuing without local media'); throw err; }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(exactFront);
+    } catch (errExact) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(idealFront);
+      } catch (errIdeal) {
+        // final fallback
+        stream = await navigator.mediaDevices.getUserMedia(fallback);
+      }
+    }
+
+    // If we obtained a stream, but the active video track is not front-facing, try to explicitly select a front camera device
+    try {
+      const vtracks = stream.getVideoTracks();
+      if (vtracks && vtracks.length > 0) {
+        const settings = vtracks[0].getSettings ? vtracks[0].getSettings() : {};
+        const facing = settings.facingMode || '';
+        // If browser reports environment/rear, attempt to enumerate devices and pick a front camera
+        if (facing && facing.toLowerCase() !== 'user') {
+          // We have permission now (because we got stream), enumerate devices
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          // find candidate videoinput whose label likely indicates front camera
+          const candidates = devices.filter(d => d.kind === 'videoinput' && d.deviceId);
+          // prefer labels containing 'front' / 'face' / 'user' / 'front camera' (case-insensitive)
+          const frontCandidate = candidates.find(d => /front|face|user|facetime|selfie/i.test(d.label));
+          if (frontCandidate && frontCandidate.deviceId) {
+            try {
+              const frontStream = await navigator.mediaDevices.getUserMedia({ audio: !!constraints.audio, video: { deviceId: { exact: frontCandidate.deviceId }, ...baseVideo } });
+              // stop old video tracks and replace
+              stream.getVideoTracks().forEach(t => { try { t.stop(); } catch(e){} });
+              stream = frontStream;
+            } catch (eReplace) {
+              console.warn('Failed to acquire explicit front camera deviceId, keeping original stream', eReplace);
+            }
+          }
+        }
+      }
+    } catch (eDetect) { console.warn('Post-getUserMedia facing detection failed', eDetect); }
+
+    // Save and create preview tile
+    localState.localStream = stream;
+    createLocalTile(stream);
+    setStatus('Local media active');
+    return stream;
+  } catch (err) {
+    console.error('getUserMedia failed:', err);
+    setStatus('Failed to access camera/microphone — check permissions');
+    throw err;
+  }
 }
 
-function setMicEnabled(enabled) { if (!localState.localStream) return; localState.localStream.getAudioTracks().forEach(t => t.enabled = !!enabled); if (el.toggleMicBtn) { el.toggleMicBtn.setAttribute('aria-pressed', String(!enabled)); el.toggleMicBtn.textContent = enabled ? '🎙️ Mic' : '🔇 Mic'; } }
+function setMicEnabled(enabled)(enabled) { if (!localState.localStream) return; localState.localStream.getAudioTracks().forEach(t => t.enabled = !!enabled); if (el.toggleMicBtn) { el.toggleMicBtn.setAttribute('aria-pressed', String(!enabled)); el.toggleMicBtn.textContent = enabled ? '🎙️ Mic' : '🔇 Mic'; } }
 function setCamEnabled(enabled) { if (!localState.localStream) return; localState.localStream.getVideoTracks().forEach(t => t.enabled = !!enabled); if (el.toggleCamBtn) { el.toggleCamBtn.setAttribute('aria-pressed', String(!enabled)); el.toggleCamBtn.textContent = enabled ? '🎥 Cam' : '🚫 Cam'; } const localTile = document.querySelector(`#tile-${localState.peerId}`); if (localTile) localTile.dataset._hasvideo = enabled ? 'true' : 'false'; }
 
 /* ======================
@@ -377,15 +437,63 @@ function startListeningToMessages(roomId) {
 }
 
 /* ======================
-   11) Join / Leave flows
+   11) Cleanup helpers: when last user leaves, remove signals/messages/room (best-effort)
    ====================== */
+async function cleanupRoomIfEmpty(roomId) {
+  if (!roomId) return;
+  try {
+    // small delay to let Firestore settle (best-effort)
+    await new Promise(res => setTimeout(res, 200));
+    const peersSnap = await getDocs(peersCollectionRef(roomId));
+    if (!peersSnap || peersSnap.empty) {
+      setStatus(`Cleaning up empty room ${roomId}`);
+      const deletions = [];
+      const signalsSnap = await getDocs(signalsCollectionRef(roomId));
+      signalsSnap.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'signals', d.id)).catch(()=>{})));
+      const msgsSnap = await getDocs(messagesCollectionRef(roomId));
+      msgsSnap.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'messages', d.id)).catch(()=>{})));
+      // remove any leftover peers docs
+      const peersSnap2 = await getDocs(peersCollectionRef(roomId));
+      peersSnap2.forEach(d => deletions.push(deleteDoc(doc(db, 'rooms', roomId, 'peers', d.id)).catch(()=>{})));
+      // try removing room doc too
+      deletions.push(deleteDoc(roomDocRef(roomId)).catch(()=>{}));
+      await Promise.all(deletions);
+      console.log('Room cleanup complete', roomId);
+    } else {
+      console.log('Room not empty — skip cleanup:', roomId, peersSnap.size);
+    }
+  } catch (e) { console.warn('cleanupRoomIfEmpty failed', e); }
+}
+
+/* ======================
+   12) Join / Leave flows + auto-nickname
+   ====================== */
+async function pickAutoDisplayName(roomId) {
+  try {
+    // Count active peers (within presence timeout)
+    const snap = await getDocs(peersCollectionRef(roomId));
+    let active = 0;
+    snap.forEach(docSnap => {
+      const d = docSnap.data(); const lastSeenMs = (d.lastSeen && d.lastSeen.toMillis) ? d.lastSeen.toMillis() : (d.lastSeen || 0);
+      if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) active++;
+    });
+    // produce Participant N where N = active + 1
+    return `Participant ${active + 1}`;
+  } catch (e) { console.warn('pickAutoDisplayName failed', e); return `Participant` + Math.floor(Math.random()*1000); }
+}
+
 async function joinRoom(roomIdInput) {
   if (localState._joined) { setStatus('Already in a room'); return; }
   const roomId = (roomIdInput && String(roomIdInput).trim()) || (window.location.hash ? window.location.hash.replace('#','') : '');
   if (!roomId) { setStatus('Please enter a Room ID before joining'); return; }
 
   localState.roomId = roomId; localState.peerId = genId('p-');
-  const dn = el.displayNameInput && el.displayNameInput.value; if (dn && dn.trim()) localState.displayName = dn.trim();
+  const dn = el.displayNameInput && el.displayNameInput.value;
+  if (dn && dn.trim()) localState.displayName = dn.trim();
+  else {
+    // auto-pick display name if none provided
+    try { const auto = await pickAutoDisplayName(roomId); localState.displayName = auto; if (el.displayNameInput) el.displayNameInput.value = auto; } catch(e) { console.warn(e); }
+  }
 
   setStatus(`Joining ${roomId} as ${localState.peerId} (${localState.displayName})`);
 
@@ -435,6 +543,8 @@ async function leaveRoom() {
   if (roomId && localState.peerId) {
     try { await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online:false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge:true }); } catch(e) { console.warn('mark offline failed', e); }
     try { await removePeerPresence(roomId, localState.peerId); } catch(e) { console.warn('remove presence failed', e); }
+    // best-effort: if we removed the last peer, clean signals/messages/room
+    try { await cleanupRoomIfEmpty(roomId); } catch(e) { console.warn('cleanup attempt failed', e); }
   }
 
   localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e){} }); localState.unsubscribers = [];
@@ -462,9 +572,10 @@ async function tryCleanupOnUnload() {
   stopVideoStatePolling(); stopPresenceHeartbeat();
   try {
     if (localState.roomId && localState.peerId) {
-      // attempt to mark offline via REST keepalive (best-effort) or Firestore set
       try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online:false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge:true }); } catch(e) { console.warn('presence set failed on unload', e); }
-      try { await removePeerPresence(localState.roomId, localState.peerId); } catch(e) { /* ignore */ }
+      try { await removePeerPresence(localState.roomId, localState.peerId); } catch(e) { console.warn('removePeerPresence failed on unload', e); }
+      // attempt cleanup when leaving
+      try { await cleanupRoomIfEmpty(localState.roomId); } catch(e) { console.warn('cleanup on unload failed', e); }
     }
   } catch (err) { console.warn('tryCleanupOnUnload error', err); }
   if (localState.localStream) localState.localStream.getTracks().forEach(t => t.stop());
@@ -475,13 +586,13 @@ window.addEventListener('beforeunload', () => { tryCleanupOnUnload(); });
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') tryCleanupOnUnload(); });
 
 /* ======================
-   12) Presence heartbeat
+   13) Presence heartbeat
    ====================== */
 function startPresenceHeartbeat() { if (localState._presenceHeartbeatInterval) return; touchPeerPresence().catch(()=>{}); localState._presenceHeartbeatInterval = setInterval(() => { touchPeerPresence().catch(()=>{}); }, PRESENCE_HEARTBEAT_MS); }
 function stopPresenceHeartbeat() { if (localState._presenceHeartbeatInterval) { clearInterval(localState._presenceHeartbeatInterval); localState._presenceHeartbeatInterval = null; } }
 
 /* ======================
-   13) Screen share
+   14) Screen share
    ====================== */
 async function startScreenShare() {
   if (!navigator.mediaDevices.getDisplayMedia) { setStatus('Screen share not supported'); return; }
@@ -508,7 +619,7 @@ async function startScreenShare() {
 }
 
 /* ======================
-   14) Chat wiring
+   15) Chat wiring
    ====================== */
 if (el.chatForm) {
   el.chatForm.addEventListener('submit', async (ev) => { ev.preventDefault(); const text = el.chatInput.value || ''; if (!localState.roomId) { setStatus('Not in a room — chat not sent'); return; } await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text); appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self:true }); el.chatInput.value = ''; });
@@ -516,7 +627,7 @@ if (el.chatForm) {
 }
 
 /* ======================
-   15) Controls wiring
+   16) Controls wiring
    ====================== */
 if (el.createRoomBtn) el.createRoomBtn.addEventListener('click', () => joinRoom(el.roomIdInput.value.trim()).catch(console.error));
 if (el.leaveRoomBtn) el.leaveRoomBtn.addEventListener('click', () => leaveRoom().catch(console.error));
@@ -526,12 +637,12 @@ if (el.shareScreenBtn) el.shareScreenBtn.addEventListener('click', () => startSc
 if (el.displayNameInput) el.displayNameInput.addEventListener('change', async () => { const nm = el.displayNameInput.value.trim() || 'Guest'; localState.displayName = nm; if (localState.roomId && localState.peerId) try { await writePeerPresence(localState.roomId, localState.peerId, { name: nm }); } catch(e){ console.warn(e); } });
 
 /* ======================
-   16) Initial preview attempt
+   17) Initial preview attempt
    ====================== */
 (async function tryInitPreview(){ try { if (!localState.localStream) { await ensureLocalStream({ audio:true, video:{ width:640, height:360 } }); setMicEnabled(true); setCamEnabled(true); } } catch(e){ console.debug('Initial preview unavailable', e); } })();
 
 /* ======================
-   17) Fit & layout helpers
+   18) Fit & layout helpers
    ====================== */
 function fitVideosToViewport() {
   try {
@@ -559,7 +670,7 @@ window.addEventListener('resize', ()=>{ fitVideosToViewport(); layoutVideoGrid()
 window.addEventListener('orientationchange', ()=>{ setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
 
 /* ======================
-   18) Visibility rules
+   19) Visibility rules
    ====================== */
 function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES) {
   try {
@@ -573,26 +684,19 @@ function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES) {
 }
 
 function detectVideoStateAndApply(maxVisible = MAX_VISIBLE_TILES) {
-  try {
-    const videosEl = document.querySelector('.videos'); if (!videosEl) return; const tiles = Array.from(videosEl.querySelectorAll('.vid')); let changed = false;
-    for (const t of tiles) {
-      const videoEl = t.querySelector('video'); let hasVideo = false; try { if (videoEl && videoEl.srcObject) { const vtracks = (videoEl.srcObject.getVideoTracks && videoEl.srcObject.getVideoTracks()) || []; hasVideo = vtracks.some(tr => tr && tr.enabled !== false); } } catch(e) { hasVideo = false; }
-      const prev = t.dataset._hasvideo === 'true'; if (prev !== hasVideo) { t.dataset._hasvideo = hasVideo ? 'true' : 'false'; changed = true; }
-    }
-    if (changed) applyVisibilityRules(maxVisible);
-  } catch(e) { console.warn('detectVideoStateAndApply error', e); }
+  try { const videosEl = document.querySelector('.videos'); if (!videosEl) return; const tiles = Array.from(videosEl.querySelectorAll('.vid')); let changed = false; for (const t of tiles) { const videoEl = t.querySelector('video'); let hasVideo = false; try { if (videoEl && videoEl.srcObject) { const vtracks = (videoEl.srcObject.getVideoTracks && videoEl.srcObject.getVideoTracks()) || []; hasVideo = vtracks.some(tr => tr && tr.enabled !== false); } } catch(e) { hasVideo = false; } const prev = t.dataset._hasvideo === 'true'; if (prev !== hasVideo) { t.dataset._hasvideo = hasVideo ? 'true' : 'false'; changed = true; } } if (changed) applyVisibilityRules(maxVisible); } catch(e) { console.warn('detectVideoStateAndApply error', e); }
 }
 
 function startVideoStatePolling(){ if (localState._videoDetectInterval) return; localState._videoDetectInterval = setInterval(()=> detectVideoStateAndApply(MAX_VISIBLE_TILES), 1200); }
 function stopVideoStatePolling(){ if (localState._videoDetectInterval) { clearInterval(localState._videoDetectInterval); localState._videoDetectInterval = null; } }
 
 /* ======================
-   19) Shortcuts & debug
+   20) Shortcuts & debug
    ====================== */
 window.addEventListener('keydown', (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'm') { ev.preventDefault(); if (localState.localStream) setMicEnabled(!localState.localStream.getAudioTracks().some(t=>t.enabled)); } if ((ev.ctrlKey || ev.metaKey) && ev.key === 'e') { ev.preventDefault(); if (localState.localStream) setCamEnabled(!localState.localStream.getVideoTracks().some(t=>t.enabled)); } });
 
 /* ======================
-   20) Auto-join from hash
+   21) Auto-join from hash
    ====================== */
 function tryAutoJoinFromHash() {
   try {
