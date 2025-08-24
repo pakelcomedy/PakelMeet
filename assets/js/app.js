@@ -974,6 +974,74 @@ if (el.displayNameInput) {
   }
 })();
 
+/* -------------------------
+   Fit videos to viewport helper
+   Call this on load, on resize, and after participant tiles change
+   ------------------------- */
+function fitVideosToViewport() {
+  try {
+    // elements that take vertical space
+    const header = document.querySelector('.site-header');
+    const roomControls = document.querySelector('#room-controls'); // section container
+    const videoSection = document.querySelector('#video-section');
+    const controls = document.querySelector('#video-section .controls') || document.querySelector('.controls');
+    const footer = document.querySelector('.site-footer');
+
+    const top = header ? header.getBoundingClientRect().height : 0;
+    const roomH = roomControls ? roomControls.getBoundingClientRect().height : 0;
+    const controlsH = controls ? controls.getBoundingClientRect().height : 0;
+    const footerH = footer ? footer.getBoundingClientRect().height : 0;
+
+    // additional safety margins (padding/gaps)
+    const extras = 32; // you can tune this (margins + breathing room)
+
+    // compute available height for the videos container
+    const vh = window.innerHeight;
+    let available = Math.max(160, Math.floor(vh - (top + roomH + controlsH + footerH + extras)));
+
+    // if the sidebar is visible and taller than available, reduce available a bit more
+    // (not strictly necessary but helps when sidebar stacked)
+    // set CSS variable on root
+    document.documentElement.style.setProperty('--videos-max-h', `${available}px`);
+
+    // choose scrolling policy:
+    // - if available is very small (<240), allow internal vertical scroll for .videos (mobile)
+    // - otherwise hide vertical scrollbar (grid will reflow and tiles shrink)
+    const videosEl = document.querySelector('.videos');
+    if (videosEl) {
+      if (available < 260) {
+        videosEl.style.overflowY = 'auto';
+      } else {
+        videosEl.style.overflowY = 'hidden';
+      }
+    }
+  } catch (err) {
+    console.warn('fitVideosToViewport error', err);
+  }
+}
+
+// call initially
+window.addEventListener('load', () => {
+  fitVideosToViewport();
+  // small delay to handle fonts/layout
+  setTimeout(fitVideosToViewport, 120);
+});
+
+// update on resize & orientation change
+window.addEventListener('resize', () => {
+  fitVideosToViewport();
+});
+// some devices fire orientationchange instead of resize
+window.addEventListener('orientationchange', () => {
+  setTimeout(fitVideosToViewport, 120);
+});
+
+/* IMPORTANT:
+   Call fitVideosToViewport() after you modify tiles (e.g., at end of updateParticipantsClass())
+   so grid recalculates using latest tile count / layout.
+   Example: put fitVideosToViewport(); inside updateParticipantsClass() after class changes.
+*/
+
 /* ======================
    19) Small UX improvements: keyboard shortcuts, helpful hints
    ====================== */
