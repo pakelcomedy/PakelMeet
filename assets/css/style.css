@@ -1,71 +1,70 @@
 /* ===========================================================
-   PakelMeet - PERFECT style.css
-   - Video-first layout (video area dominates)
-   - Sidebar (chat, profile, status) is secondary and compact
-   - Responsive for 1..9 participants via JS toggles (participants-N)
-   - Accessible focus states, reduced-motion support
-   - Clean variables and comments for easy tuning
-   Place this at: assets/css/style.css
+   PakelMeet - REWORKED style.css (solid black, no sliders, responsive)
+   - Solid black background
+   - Video-first responsive grid (auto-fit) -> no horizontal slider
+   - Tiles use aspect-ratio so they always fit and do not overflow
+   - Sidebar compact; chat scrolls inside its area (vertical only)
+   - Accessibility & mobile-friendly controls
+   - Place in: assets/css/style.css (replace previous)
    =========================================================== */
 
 /* ---------------------------
-   Theme variables (edit here)
+   VARIABLES (tweak here)
    --------------------------- */
 :root{
-  /* Colors */
-  --bg-1: #061018;            /* page background top */
-  --bg-2: #07131b;            /* page background bottom */
-  --panel-1: #0b151b;         /* card background */
-  --panel-2: #081017;
-  --muted: #98a6b3;           /* secondary text */
-  --text: #e8f0f7;            /* primary text */
-  --accent: #4cc9f0;          /* primary accent */
+  /* Colors: solid dark theme */
+  --black: #000000;         /* page background (solid) */
+  --panel: #070707;         /* card background (nearly black) */
+  --panel-2: #0b0b0b;       /* slightly lighter panel */
+  --muted: #9aa6b3;
+  --text: #eceff3;
+  --accent: #2fc7f2;
   --accent-2: #2bb3e6;
-  --danger: #ff6b6b;          /* danger color */
-  --glass: rgba(255,255,255,0.02);
-  --glass-2: rgba(255,255,255,0.015);
+  --danger: #ff5c5c;
 
   /* Layout */
-  --max-width: 1180px;        /* main container width */
-  --sidebar-w: 320px;         /* sidebar width on desktop */
-  --gap: 16px;                /* global gap */
-  --radius-lg: 12px;
-  --radius-sm: 8px;
+  --max-width: 1200px;
+  --sidebar-w: 320px;
+  --gap: 14px;
+  --radius: 10px;
 
-  /* Shadows & transitions */
-  --shadow-1: 0 10px 30px rgba(0,0,0,0.6);
+  /* Tile sizing: minimum ideal tile width */
+  --tile-min: 220px;       /* min width for a tile (changes grid wrapping) */
+  --tile-max: 420px;       /* max comfortable tile width */
+
+  /* UI */
+  --control-h: 44px;
+  --shadow: 0 10px 30px rgba(0,0,0,0.65);
+
   --easing: cubic-bezier(.2,.9,.2,1);
   --fast: 150ms;
-  --med: 260ms;
 }
 
 /* ---------------------------
-   Base reset & accessibility
+   Global reset & page-level
    --------------------------- */
 * { box-sizing: border-box; }
 html,body { height:100%; }
 body{
   margin:0;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  background: var(--black);       /* SOLID BLACK */
+  color: var(--text);
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
   -webkit-font-smoothing:antialiased;
   -moz-osx-font-smoothing:grayscale;
-  color: var(--text);
-  background: linear-gradient(180deg, var(--bg-1), var(--bg-2) 70%);
   line-height:1.35;
   font-size:15px;
-  -webkit-font-feature-settings: "ss01" on;
+  overflow-x: hidden;             /* prevent any horizontal slider */
 }
 
-/* Make media elements behave */
-img, video, svg { display:block; max-width:100%; }
+/* make sure no element causes horizontal overflow by default */
+img,video,svg { max-width:100%; height:auto; display:block; }
+a { color: var(--accent); text-decoration: none; }
 
-/* Hidden helper for accessibility */
+/* visually-hidden helper */
 .visually-hidden {
-  position: absolute !important;
-  width: 1px; height: 1px;
-  padding: 0; margin: -1px;
-  overflow: hidden; clip: rect(0,0,0,0);
-  white-space: nowrap; border: 0;
+  position:absolute!important;
+  height:1px;width:1px;overflow:hidden;clip:rect(1px,1px,1px,1px);white-space:nowrap;
 }
 
 /* ---------------------------
@@ -73,11 +72,10 @@ img, video, svg { display:block; max-width:100%; }
    --------------------------- */
 #app {
   max-width: var(--max-width);
-  margin: 20px auto;
-  padding: 18px;
-  display: block;
+  margin: 18px auto;
+  padding: 16px;
+  display:block;
   gap: var(--gap);
-  -webkit-tap-highlight-color: transparent;
 }
 
 .site-header {
@@ -86,220 +84,153 @@ img, video, svg { display:block; max-width:100%; }
   justify-content:space-between;
   gap:12px;
   margin-bottom: 12px;
+  padding: 6px 2px;
 }
-.brand h1 {
+.brand h1{
   margin:0;
   font-size:20px;
   font-weight:700;
-  letter-spacing: .2px;
+  color: var(--text);
 }
-.brand h1 small {
-  margin-left:8px;
-  font-size:12px;
-  color:var(--muted);
-  font-weight:600;
-}
-.meta { color:var(--muted); font-size:13px; }
+.brand h1 small{ font-weight:600; font-size:12px; color:var(--muted); margin-left:8px; }
 
 /* ---------------------------
-   Global card style
+   Card style (dark, crisp)
    --------------------------- */
 .card {
-  background: linear-gradient(180deg, var(--panel-1), var(--panel-2));
-  border-radius: var(--radius-lg);
-  padding: 14px;
-  border: 1px solid rgba(255,255,255,0.03);
-  box-shadow: var(--shadow-1);
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding:12px;
+  border: 1px solid rgba(255,255,255,0.025);
+  box-shadow: var(--shadow);
 }
 
-/* Small utility */
-.label { display:block; color:var(--muted); font-size:13px; margin-bottom:6px; }
-.hint { color:var(--muted); font-size:13px; margin-top:6px; }
-.small { color:var(--muted); font-size:12px; }
+/* small helpers */
+.label{ display:block; margin-bottom:6px; color:var(--muted); font-size:13px; }
+.hint{ color:var(--muted); font-size:13px; margin-top:6px; }
+.small{ color:var(--muted); font-size:12px; }
 
 /* ---------------------------
-   Main layout: video area + sidebar
+   Layout: main content + sidebar
+   - Left column (video area) priority; right column sidebar fixed
+   - We use minmax for left so it never shrinks too small
    --------------------------- */
-/* Desktop default: left = video (flexible), right = sidebar (fixed) */
 main#main {
   display: grid;
-  grid-template-columns: minmax(720px, 1fr) var(--sidebar-w);
-  gap: 20px;
+  grid-template-columns: minmax(640px, 1fr) var(--sidebar-w);
+  gap: 18px;
   align-items: start;
+  width: 100%;
 }
 
-/* Sidebar collapses and stacks below on small screens */
-@media (max-width: 880px) {
-  main#main {
-    grid-template-columns: 1fr;
-  }
+/* Stack on narrower screens */
+@media (max-width: 920px) {
+  main#main { grid-template-columns: 1fr; }
 }
 
 /* ---------------------------
-   Room controls (top of left column)
+   Room controls: consistent spacing
    --------------------------- */
 .room-controls { display:flex; flex-direction:column; gap:12px; }
-.room-form {
-  display:flex;
-  gap:12px;
-  align-items:flex-end;
-}
+.room-form { display:flex; gap:12px; align-items:flex-end; width:100%; }
+.room-form .form-field { flex:1; display:flex; flex-direction:column; gap:6px; }
 .room-form input[type="text"]{
-  flex:1;
-  padding:12px;
-  border-radius:12px;
-  background: var(--glass);
+  width:100%;
+  padding:10px 12px;
+  border-radius: 10px;
+  background: transparent;
   border: 1px solid rgba(255,255,255,0.03);
   color:var(--text);
-  font-size:15px;
+  font-size:14px;
 }
-.room-form input::placeholder { color: rgba(255,255,255,0.2); }
-.room-form .actions { display:flex; gap:8px; align-items:center; }
-.room-form button {
-  padding:10px 14px;
-  border-radius:12px;
-  border:0;
-  cursor:pointer;
-  font-weight:700;
-  transition: transform var(--fast) var(--easing), box-shadow var(--fast);
-  background: linear-gradient(180deg,#113145,#0b2a32);
-  color: var(--text);
-  box-shadow: 0 6px 18px rgba(8,20,28,0.45);
-}
-.room-form button.primary { background: linear-gradient(180deg,#0f5f78,#074f61); }
-.room-form button.danger { background: linear-gradient(180deg,#4a1f24,#311416); }
-.room-form button:active{ transform: translateY(1px); }
-.room-form button[disabled] { opacity: .45; cursor: not-allowed; transform: none; }
+.room-form input::placeholder{ color: rgba(255,255,255,0.16); }
 
-/* Share url text */
-.share-url { margin-top:8px; color:var(--muted); font-size:13px; }
+.room-form .actions{ display:flex; gap:8px; align-items:center; }
+.button{
+  display:inline-flex; align-items:center; justify-content:center;
+  padding:10px 14px; height:var(--control-h); border-radius:10px;
+  background: #0f2a32; color:var(--text); border:0; cursor:pointer;
+  font-weight:700; transition: transform var(--fast) var(--easing), box-shadow var(--fast);
+}
+.button.primary{ background: linear-gradient(180deg,#0f5f78,#074f61); }
+.button.danger{ background: linear-gradient(180deg,#5a2328,#361214); }
+.button:active{ transform: translateY(1px); }
+.button[disabled]{ opacity:.5; cursor:not-allowed; }
+
+/* Share url text subtle */
+.share-url{ color:var(--muted); font-size:13px; margin-top:6px; word-break: break-all; }
 
 /* ---------------------------
-   Video section: big, central
+   VIDEO AREA (video-first)
+   Key: use auto-fit grid so tiles wrap, no horizontal scroll
    --------------------------- */
-.video-section { display:flex; flex-direction:column; gap:12px; }
+.video-section{ display:flex; flex-direction:column; gap:12px; width:100%; }
 
-/* Videos container: video-first and visually dominant */
+/* Videos grid:
+   - auto-fit tries to fill each row with as many tiles as fit
+   - minmax ensures each tile never gets smaller than --tile-min
+   - aspect-ratio on .vid ensures height adjusts automatically
+*/
 .videos {
   display: grid;
-  gap: 12px;
+  gap: var(--gap);
+  grid-template-columns: repeat(auto-fit, minmax(clamp(180px, 28vw, var(--tile-max)), 1fr));
+  align-items: start;
   width:100%;
-  align-items:stretch;
-  min-height: 420px;
-  max-height: calc(100vh - 220px);
-  overflow: auto;
-  padding: 10px;
-  border-radius: 12px;
-  background: linear-gradient(180deg, rgba(255,255,255,0.006), rgba(255,255,255,0.003));
-  border: 1px solid rgba(255,255,255,0.01);
-  box-shadow: 0 8px 30px rgba(0,0,0,0.45);
+  padding: 8px;
+  border-radius: var(--radius);
+  background: var(--panel-2);         /* distinct but dark */
+  border: 1px solid rgba(255,255,255,0.02);
+  /* allow vertical scrolling of page, but prevent internal horizontal scrolling */
+  overflow-x: hidden;
+  overflow-y: visible;
 }
 
-/* ---------------------------
-   Participant-count classes (toggle with JS)
-   Balanced templates to keep tile sizes similar
-   --------------------------- */
-#videos.participants-1 { grid-template-columns: 1fr; grid-auto-rows: minmax(360px, 1fr); }
-#videos.participants-2 { grid-template-columns: repeat(2, 1fr); grid-auto-rows: minmax(260px, 1fr); }
-#videos.participants-3 { grid-template-columns: repeat(2, 1fr); grid-auto-rows: minmax(220px, 1fr); }
-#videos.participants-4 { grid-template-columns: repeat(2, 1fr); grid-auto-rows: minmax(200px, 1fr); }
-#videos.participants-5 { grid-template-columns: repeat(3, 1fr); grid-auto-rows: minmax(160px, 1fr); }
-#videos.participants-6 { grid-template-columns: repeat(3, 1fr); grid-auto-rows: minmax(150px, 1fr); }
-#videos.participants-7 { grid-template-columns: repeat(3, 1fr); grid-auto-rows: minmax(140px, 1fr); }
-#videos.participants-8 { grid-template-columns: repeat(4, 1fr); grid-auto-rows: minmax(120px, 1fr); }
-#videos.participants-9 { grid-template-columns: repeat(3, 1fr); grid-auto-rows: minmax(120px, 1fr); }
+/* Remove hard min-height to avoid causing scrollbars — tiles define visual size */
+.videos:empty { min-height: 260px; display:flex; align-items:center; justify-content:center; color:var(--muted); }
 
-/* Ensure consistent gap and tile sizing on narrow screens */
-@media (max-width: 1100px) {
-  .videos { min-height: 360px; max-height: calc(100vh - 240px); }
-}
-@media (max-width: 520px) {
-  .videos { padding: 6px; min-height: 300px; max-height: none; overflow: visible; }
-}
-
-/* ---------------------------
-   Video tile: .vid elements (mounted by JS)
-   --------------------------- */
+/* Video tile: each tile uses aspect-ratio so heights are predictable */
 .vid {
   position: relative;
-  border-radius: 12px;
+  width: 100%;
+  aspect-ratio: 16 / 9;                /* preserves video aspect */
+  border-radius: 10px;
   overflow: hidden;
   background: #000;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  min-height: 140px;
-  border: 1px solid rgba(255,255,255,0.03);
-  transition: box-shadow var(--fast) var(--easing), transform var(--fast) var(--easing);
-  aspect-ratio: 16/9; /* helps keep tiles natural */
+  border: 1px solid rgba(255,255,255,0.02);
+  display:flex; align-items:center; justify-content:center;
+  transition: transform var(--fast) var(--easing), box-shadow var(--fast);
 }
+
+/* ensure video element fills tile perfectly */
 .vid video {
-  width:100%;
-  height:100%;
-  object-fit: cover;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;                  /* crop to cover tile without distortion */
   display:block;
   background: black;
 }
 
-/* Name badge (bottom-left) */
+/* overlay elements */
 .vid .name {
-  position: absolute;
-  left: 10px;
-  bottom: 10px;
-  padding: 6px 10px;
-  border-radius: 999px;
-  background: linear-gradient(180deg, rgba(0,0,0,0.45), rgba(0,0,0,0.25));
-  font-size: 13px;
-  color: var(--text);
-  backdrop-filter: blur(6px);
+  position:absolute; left:10px; bottom:10px;
+  padding:6px 10px; border-radius:999px;
+  background: rgba(0,0,0,0.5); color:var(--text);
+  font-size:13px; backdrop-filter: blur(4px);
 }
+.vid .badges { position:absolute; right:10px; bottom:10px; display:flex; gap:8px; }
+.badge { background: rgba(0,0,0,0.45); padding:6px 8px; border-radius:999px; color:var(--muted); font-size:12px; }
+.vid.muted { opacity:.6; }
+.vid .muted-overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--muted); background: rgba(0,0,0,0.45); }
 
-/* Badges (bottom-right) */
-.vid .badges {
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  display:flex;
-  gap:8px;
-}
-.badge {
-  display:inline-flex;
-  align-items:center;
-  gap:6px;
-  padding:6px 8px;
-  border-radius:999px;
-  background: rgba(0,0,0,0.45);
-  font-size:12px;
-  color:var(--muted);
-}
-.badge.muted { color:#ffd0d0; }
+/* active speaker visual */
+.vid.active { outline: 3px solid rgba(47,199,242,0.08); box-shadow: 0 20px 50px rgba(47,199,242,0.03); transform: translateY(-4px); }
 
-/* Muted/camera-off overlay */
-.vid.muted { opacity: 0.6; }
-.vid .muted-overlay {
-  position:absolute;
-  inset:0;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  background: linear-gradient(180deg, rgba(0,0,0,0.45), rgba(0,0,0,0.6));
-  font-size:13px;
-  color:var(--muted);
-}
-
-/* Keyboard focus / active speaker */
-.vid:focus {
-  outline: none;
-  box-shadow: 0 12px 36px rgba(0,0,0,0.6);
-  transform: translateY(-4px);
-}
-.vid.active {
-  outline: 3px solid rgba(76,201,240,0.12);
-  box-shadow: 0 18px 48px rgba(43,179,230,0.06);
-}
+/* keyboard focus */
+.vid:focus { outline: none; box-shadow: 0 12px 36px rgba(0,0,0,0.6); }
 
 /* ---------------------------
-   Global controls row (below videos)
+   Controls row: stable below videos
    --------------------------- */
 .controls {
   display:flex;
@@ -309,167 +240,122 @@ main#main {
   padding: 6px 4px;
   width:100%;
 }
-.controls button {
-  height:44px;
-  min-width:140px;
-  border-radius:12px;
-  border:0;
-  background: linear-gradient(180deg,#0f2a36,#07161c);
-  color:var(--text);
-  font-weight:700;
-  cursor:pointer;
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-  gap:8px;
-  padding:10px 14px;
-  transition: transform var(--fast) var(--easing), box-shadow var(--fast);
-}
-.controls button:hover {
-  transform: translateY(-3px);
-  box-shadow: 0 8px 22px rgba(0,0,0,0.45);
-}
-.controls button[aria-pressed="true"] {
-  outline: 2px solid rgba(76,201,240,0.18);
-  box-shadow: 0 6px 18px rgba(12,28,36,0.5);
-}
-
-/* On small screens, controls become a stacked block */
-@media (max-width: 520px) {
-  .controls { flex-direction: column; gap:8px; padding: 8px 0; }
-  .controls button { min-width: unset; width:100%; }
+.controls .button { min-width: 120px; }
+@media (max-width:520px) {
+  .controls { flex-direction: column; width:100%; gap:10px; }
+  .controls .button { width:100%; min-width: unset; }
 }
 
 /* ---------------------------
-   Sidebar: compact and secondary
+   SIDEBAR (secondary, compact)
+   - sidebar content scrolls internally if tall, to avoid page horizontal scroll
    --------------------------- */
 .sidebar {
   display:flex;
   flex-direction:column;
   gap:12px;
+  min-width: 180px;
+  max-width: var(--sidebar-w);
 }
 
-/* Make sidebar visually lighter than video area */
+/* make sidebar cards lighter contrast and allow internal scrolling */
 .sidebar .card {
+  background: var(--panel);
   padding:12px;
-  background: linear-gradient(180deg, rgba(255,255,255,0.012), rgba(255,255,255,0.01));
+  border-radius: var(--radius);
   box-shadow: none;
   border: 1px solid rgba(255,255,255,0.02);
 }
 
-/* Profile input */
+/* profile input */
 .profile input {
-  width:100%;
-  padding:10px;
-  border-radius:10px;
-  background: var(--glass);
-  color:var(--text);
-  border:1px solid rgba(255,255,255,0.03);
+  width:100%; padding:10px; border-radius:8px;
+  border:1px solid rgba(255,255,255,0.03); background: transparent; color:var(--text);
 }
 
-/* Chat box: reduced size (secondary), not dominant */
+/* chat: intentionally smaller, overflow inside chat box (vertical only) */
 .chat-box {
-  height: 220px;              /* intentionally smaller */
+  height: 200px;               /* smaller, consistent */
   max-height: 40vh;
-  min-height: 140px;
+  min-height: 120px;
   overflow-y: auto;
+  overflow-x: hidden;
   padding:8px;
-  border-radius:10px;
-  background: linear-gradient(180deg, rgba(255,255,255,0.008), rgba(255,255,255,0.006));
+  border-radius:8px;
+  background: rgba(255,255,255,0.01);
   border: 1px solid rgba(255,255,255,0.02);
 }
-.chat-box .msg {
-  margin:8px 0;
-  display:flex;
-  flex-direction:column;
-  gap:6px;
-}
+
+/* ensure chat aria-live messages appear and auto-scroll via JS */
+.chat-box .msg { margin:8px 0; }
 .chat-box .meta { font-size:12px; color:var(--muted); }
-.chat-form {
-  display:flex; gap:8px; margin-top:8px;
-}
-.chat-form input[type="text"] {
-  flex:1; padding:8px; border-radius:10px; background:transparent;
-  border:1px solid rgba(255,255,255,0.03); color:var(--text);
-}
-.chat-form button {
-  padding:8px 12px; border-radius:10px; border:0; background: linear-gradient(180deg,#0f5f78,#074f61);
-  color:var(--text); font-weight:700;
-}
 
-/* Status */
-.status #status {
-  padding:10px;
-  border-radius:10px;
-  background: rgba(255,255,255,0.02);
-  border: 1px dashed rgba(255,255,255,0.03);
-  color:var(--muted);
-}
+/* chat form compact */
+.chat-form{ display:flex; gap:8px; margin-top:8px; align-items:center; }
+.chat-form input[type="text"]{ flex:1; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.03); background:transparent; color:var(--text); }
+.chat-form button { padding:8px 12px; border-radius:8px; }
+
+/* status box */
+.status #status { padding:10px; border-radius:8px; background: rgba(255,255,255,0.01); color:var(--muted); border:1px dashed rgba(255,255,255,0.02); }
 
 /* ---------------------------
-   Footer
+   FOOTER
    --------------------------- */
-.site-footer {
-  margin-top:18px;
-  color:var(--muted);
-  font-size:13px;
-  text-align:center;
-}
+.site-footer { margin-top:18px; color:var(--muted); font-size:13px; text-align:center; }
 
 /* ---------------------------
-   Accessibility & focus
+   Accessibility focus styles
    --------------------------- */
-:focus { outline: 2px solid rgba(76,201,240,0.15); outline-offset:2px; }
+:focus { outline: 2px solid rgba(47,199,242,0.10); outline-offset:2px; }
 button:focus-visible, input:focus-visible {
-  box-shadow: 0 0 0 4px rgba(76,201,240,0.08);
-  border-radius: 10px;
+  box-shadow: 0 0 0 4px rgba(47,199,242,0.06);
+  border-radius:8px;
 }
 
-/* Prefers reduced motion */
+/* ---------------------------
+   No-horizontal-scroll safeguard (extra)
+   - prevents accidental overflow from borders/margins
+   --------------------------- */
+html, body, #app, main#main { max-width: 100%; overflow-x: hidden; }
+
+/* ---------------------------
+   Responsive tweaks
+   --------------------------- */
+@media (max-width: 1100px) {
+  main#main { grid-template-columns: 1fr var(--sidebar-w); }
+  .videos { grid-template-columns: repeat(auto-fit, minmax(clamp(180px, 36vw, var(--tile-max)), 1fr)); }
+}
+@media (max-width: 920px) {
+  main#main { grid-template-columns: 1fr; }
+  .sidebar { width:100%; max-width:none; order:2; }
+  .video-section { order:1; }
+  .videos { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+}
+
+/* ---------------------------
+   Performance / motion preference
+   --------------------------- */
 @media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; }
+  * { transition: none !important; animation: none !important; }
 }
 
 /* ---------------------------
-   Empty state & utilities
+   Micro polish
+   - subtle enter animation that won't cause layout shift
    --------------------------- */
-.videos:empty {
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  min-height: 220px;
-  color:var(--muted);
-  font-size:15px;
+@keyframes softPop {
+  from { opacity: 0; transform: translateY(6px) scale(.998); } 
+  to { opacity: 1; transform: none; }
 }
-.hidden { display:none !important; }
-.center { text-align:center; }
+.vid { animation: softPop 220ms var(--easing) both; }
 
 /* ---------------------------
-   Notes for JS integration (do not change)
+   Notes for JS integration:
    - JS should:
-     * add ONE class participants-N (1..9) on the #videos element
-     * mount each tile as a direct child of #videos with class .vid
-     * within .vid: <video autoplay playsinline></video>, and optional .name, .badges
-     * toggle .vid.muted (camera off) and .vid.active (active speaker)
+     * add class participants-N to #videos (1..9) if desired for alternative layout logic
+     * mount tiles as children of #videos with class .vid and <video> inside
+     * use .vid.muted and .vid.active states for visuals
+     * keep only vertical scrolling; horizontal scroll should never appear
    --------------------------- */
 
-/* ---------------------------
-   Final micro-tweaks for visual polish
-   --------------------------- */
-@keyframes subtlePop {
-  from { transform: scale(.994); opacity: 0; }
-  to { transform: none; opacity: 1; }
-}
-.vid { animation: subtlePop var(--med) var(--easing) both; }
-
-/* Slightly dim the sidebar title text so it's secondary */
-.sidebar .card h3, .sidebar .card .label {
-  color: rgba(255,255,255,0.72);
-  font-weight:600;
-  font-size:13px;
-}
-
-/* reduce visual competition: subtle contrast for chat header */
-.sidebar .card.chat { box-shadow: none; }
-
-/* End of style.css */
+/* End of reworked style.css */
