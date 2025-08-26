@@ -1,15 +1,15 @@
 /* ==========================================================
-  PakelMeet — assets/js/app.js (FIXED & PRODUCTION-READY v2)
-  - Major fixes to guarantee local camera preview shows reliably on first join
-  - Robust front-camera selection on mobile
-  - Replace/add tracks instead of duplicating
-  - Ensure video.play() is attempted and metadata handled
-  - Proper cleanup and best-effort room cleanup when last peer leaves
-  - Auto nickname, auto-join from hash, visibility rules maintained
-
-  Usage: <script type="module" src="/assets/js/app.js" defer></script>
-  NOTE: Replace firebaseConfig with your Firebase credentials if desired.
-  ========================================================== */
+   PakelMeet — assets/js/app.js (REWRITTEN, production-ready)
+   - Robust local preview (front-camera heuristics on mobile)
+   - Consistent signaling payloads (object { type, sdp })
+   - Use RTCIceCandidate for addIceCandidate
+   - Replace tracks instead of duplicating
+   - Best-effort video.play() handling
+   - Proper aria-pressed semantics
+   - Clean room join/leave with presence heartbeat + best-effort cleanup
+   - Defensive checks for missing DOM elements
+   - Helpful console export for debugging
+   ========================================================== */
 
 /* ======================
    1) Firebase imports (ES modules)
@@ -46,12 +46,19 @@ signInAnonymously(auth).catch(err => console.warn('Firebase anon sign-in failed'
 onAuthStateChanged(auth, user => { currentUser = user; console.log('Auth changed -> anon?', !!user); });
 
 /* ======================
-   3) App state & constants
+   3) App constants & state
    ====================== */
-const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+// Replace/add TURN servers here for production reliability.
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  // Example TURN (replace with your own provider)
+  // { urls: 'turn:turn.example.com:3478', username: 'user', credential: 'pass' }
+];
+
 const PRESENCE_HEARTBEAT_MS = 5000;   // heartbeat interval
-const PRESENCE_TIMEOUT_MS = 15000;    // consider stale if older than this
-const MAX_VISIBLE_TILES = 4;          // show up to 4 tiles (changeable)
+const PRESENCE_TIMEOUT_MS = 15000;    // consider stale peers older than this
+const MAX_VISIBLE_TILES = 4;          // number of visible tiles before hiding extras
+const VIDEO_POLL_INTERVAL_MS = 1200;  // detect video state periodically
 
 const localState = {
   roomId: null,
@@ -63,19 +70,19 @@ const localState = {
   localStream: null,
   screenStream: null,
   unsubscribers: [],
-  peerMeta: new Map(),
+  peerMeta: new Map(), // peerId -> { name, createdAtMs, lastSeenMs, online }
   _videoDetectInterval: null,
   _presenceHeartbeatInterval: null,
-  _autoJoinedFromHash: false,
   _joined: false,
+  _autoJoinedFromHash: false,
   _removeHashAfterAutoJoin: false,
 };
 
 /* ======================
-   4) DOM shortcuts
+   4) DOM helpers
    ====================== */
-const $ = s => document.querySelector(s);
-const $$ = s => Array.from(document.querySelectorAll(s));
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
 
 const el = {
   roomControlsSection: $('#room-controls'),
@@ -83,7 +90,7 @@ const el = {
   roomIdInput: $('#roomId'),
   createRoomBtn: $('#createRoom'),
   leaveRoomBtn: $('#leaveRoom'),
-  shareUrl: $('#shareUrl'),
+  shareUrl: $('#shareUrl'), // may be absent
   videos: $('#videos'),
   displayNameInput: $('#displayName'),
   toggleMicBtn: $('#toggleMic'),
@@ -95,32 +102,24 @@ const el = {
   sendChatBtn: $('#sendChat'),
   status: $('#status'),
 };
-for (const k in el) if (!el[k]) console.debug('DOM missing:', k);
 
-function ensureShowControlsButton() {
-  let b = $('#showControlsBtn');
-  if (b) return b;
-  b = document.createElement('button');
-  b.id = 'showControlsBtn';
-  b.textContent = 'Show room controls';
-  b.style.position = 'fixed'; b.style.bottom = '12px'; b.style.left = '12px'; b.style.zIndex = '9999';
-  b.style.padding = '8px 12px'; b.style.borderRadius = '8px';
-  b.addEventListener('click', () => {
-    if (el.roomControlsSection) el.roomControlsSection.style.display = '';
-    b.style.display = 'none';
-  });
-  document.body.appendChild(b);
-  return b;
+function setStatus(msg) {
+  if (el.status) el.status.textContent = msg;
+  console.log('[status]', msg);
 }
 
-/* ======================
-   5) Utilities
-   ====================== */
-const genId = pref => pref + Math.random().toString(36).slice(2,9);
-function setStatus(msg) { if (el.status) el.status.textContent = msg; console.log('[status]', msg); }
-function safeCreateElem(tag, attrs={}) { const e = document.createElement(tag); for (const k in attrs) { if (k === 'class') e.className = attrs[k]; else if (k === 'text') e.textContent = attrs[k]; else e.setAttribute(k, attrs[k]); } return e; }
+function safeCreateElem(tag, attrs = {}) {
+  const e = document.createElement(tag);
+  for (const k in attrs) {
+    if (k === 'class') e.className = attrs[k];
+    else if (k === 'text') e.textContent = attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  }
+  return e;
+}
 
-function appendLogToChat({ name='', text='', ts=Date.now(), self=false }) {
+/* Chat log */
+function appendLogToChat({ name = '', text = '', ts = Date.now(), self = false }) {
   if (!el.chatBox) return;
   const wrap = safeCreateElem('div', { class: 'msg' });
   const meta = safeCreateElem('div', { class: 'meta', text: `${name} · ${new Date(ts).toLocaleTimeString()}` });
@@ -131,45 +130,50 @@ function appendLogToChat({ name='', text='', ts=Date.now(), self=false }) {
   el.chatBox.scrollTop = el.chatBox.scrollHeight;
 }
 
+/* Utility: detect active video tracks on a stream */
 function hasActiveVideoFromStream(stream) {
-  try { if (!stream) return false; const tracks = stream.getVideoTracks ? stream.getVideoTracks() : []; return tracks.some(t => t && t.enabled !== false); } catch (e) { return false; }
+  try {
+    if (!stream) return false;
+    const tracks = stream.getVideoTracks ? stream.getVideoTracks() : [];
+    return tracks.some(t => t && t.enabled !== false && (t.readyState !== 'ended'));
+  } catch (e) {
+    return false;
+  }
 }
 
 /* ======================
-   6) Video tile helpers (robust)
+   5) Video tile helpers (robust)
    ====================== */
 function removeLocalTileIfExists() {
   try {
     const existing = document.querySelector('.vid.local');
     if (existing) existing.remove();
-  } catch(e){}
+  } catch (e) {}
 }
 
 async function ensureVideoPlays(videoEl) {
-  // try to play; some mobile browsers require user gesture — handle gracefully
+  if (!videoEl) return;
   try {
     if (typeof videoEl.play === 'function') {
       await videoEl.play();
     }
-  } catch(e) {
-    // ignore — autoplay policy may prevent play; element will start once permitted
-    console.debug('video.play() failed (autoplay policy)', e);
+  } catch (e) {
+    // ignore autoplay policy rejections; user gesture will resume
+    console.debug('video.play() issue', e);
   }
 }
 
 function createLocalTile(stream) {
-  // remove any old local tile (previews) to avoid duplicates
   removeLocalTileIfExists();
-
   const tpl = document.querySelector('#video-tile-template');
   const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : safeCreateElem('div', { class: 'vid' });
   container.dataset.peer = localState.peerId || 'local';
-  container.classList.add('vid','local');
+  container.classList.add('vid', 'local');
   container.id = `tile-${localState.peerId || 'local'}`;
 
   const videoEl = container.querySelector('video') || safeCreateElem('video');
-  videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true; // local muted to allow autoplay
-  try { videoEl.srcObject = stream; } catch(e){ console.warn('Failed set srcObject local', e); }
+  videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true;
+  try { videoEl.srcObject = stream; } catch (e) { console.warn('Failed set srcObject local', e); }
   if (!container.contains(videoEl)) container.appendChild(videoEl);
 
   const nameEl = container.querySelector('[data-hook="video-name"]') || safeCreateElem('div', { class: 'name' });
@@ -179,21 +183,18 @@ function createLocalTile(stream) {
   container.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
   if (el.videos) el.videos.prepend(container);
 
-  // attempt to play (best-effort) and listen for metadata
   const tryPlay = async () => {
-    try {
-      await ensureVideoPlays(videoEl);
-      // if still not showing, re-trigger layout after a tick
-      setTimeout(() => { try { videoEl.play && videoEl.play().catch(()=>{}); } catch(e){} updateParticipantsClass(); }, 160);
-    } catch(e){ console.warn('ensureVideoPlays failed', e); }
+    await ensureVideoPlays(videoEl).catch(()=>{});
+    setTimeout(()=> { try { videoEl.play && videoEl.play().catch(()=>{}); } catch(e){} updateParticipantsClass(); }, 120);
   };
-  if (videoEl.readyState >= 2) tryPlay(); else { videoEl.addEventListener('loadedmetadata', tryPlay, { once:true }); }
+
+  if (videoEl.readyState >= 2) tryPlay(); else videoEl.addEventListener('loadedmetadata', tryPlay, { once:true });
 
   updateParticipantsClass();
   return container;
 }
 
-function addRemoteTile(peerId, name='Participant') {
+function addRemoteTile(peerId, name = 'Participant') {
   if (document.querySelector(`#tile-${peerId}`)) return document.querySelector(`#tile-${peerId}`);
   const tpl = document.querySelector('#video-tile-template');
   const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : safeCreateElem('div', { class: 'vid' });
@@ -202,7 +203,8 @@ function addRemoteTile(peerId, name='Participant') {
   videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = false;
   if (!container.contains(videoEl)) container.appendChild(videoEl);
   const nameEl = container.querySelector('[data-hook="video-name"]') || safeCreateElem('div', { class: 'name' });
-  nameEl.textContent = name || 'Participant'; if (!container.contains(nameEl)) container.appendChild(nameEl);
+  nameEl.textContent = name || 'Participant';
+  if (!container.contains(nameEl)) container.appendChild(nameEl);
   container.dataset._hasvideo = 'false';
   if (el.videos) el.videos.appendChild(container);
   updateParticipantsClass();
@@ -229,6 +231,7 @@ function removeTile(peerId) {
   updateParticipantsClass();
 }
 
+/* Update CSS classes / layout based on participants count */
 function updateParticipantsClass() {
   if (!el.videos) return;
   const tiles = el.videos.querySelectorAll('.vid');
@@ -242,17 +245,19 @@ function updateParticipantsClass() {
 }
 
 /* ======================
-   7) Local media (improved & robust)
+   6) Local media acquisition (robust)
    ====================== */
 async function ensureLocalStream(constraints = { audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } }) {
-  // If we already have a localStream that's active, return it
   try {
+    // If we have a live stream, reuse
     if (localState.localStream) {
       const vtracks = localState.localStream.getVideoTracks();
-      if (vtracks && vtracks.length > 0 && vtracks.some(t => !t.readyState || t.readyState !== 'ended')) return localState.localStream;
-      // if tracks ended, fall through to re-acquire
+      if (vtracks && vtracks.length > 0 && vtracks.some(t => t && t.readyState !== 'ended')) return localState.localStream;
+      // else fallthrough to re-acquire
     }
-  } catch(e) { console.warn('localStream check failed', e); }
+  } catch (e) {
+    console.warn('localStream check failed', e);
+  }
 
   const audioWanted = !!(constraints && constraints.audio);
   const baseVideo = (constraints && typeof constraints.video === 'object') ? { ...constraints.video } : {};
@@ -260,6 +265,7 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
   async function listVideoInputs() {
     try { const devices = await navigator.mediaDevices.enumerateDevices(); return devices.filter(d => d.kind === 'videoinput'); } catch (e) { return []; }
   }
+
   function findFrontCandidate(devices) {
     if (!devices || devices.length === 0) return null;
     const labeled = devices.filter(d => d.label && d.label.trim().length > 0);
@@ -270,15 +276,24 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
     return devices[0] || null;
   }
 
-  async function tryByDeviceId(deviceId) { if (!deviceId) return null; try { return await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: { deviceId: { exact: deviceId }, ...baseVideo } }); } catch (e) { return null; } }
-  async function tryByFacingMode(mode, useExact=false) { try { const fm = useExact ? { exact: mode } : { ideal: mode }; return await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: { ...baseVideo, facingMode: fm } }); } catch (e) { return null; } }
+  async function tryByDeviceId(deviceId) {
+    if (!deviceId) return null;
+    try { return await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: { deviceId: { exact: deviceId }, ...baseVideo } }); } catch (e) { return null; }
+  }
+
+  async function tryByFacingMode(mode, useExact = false) {
+    try {
+      const fm = useExact ? { exact: mode } : { ideal: mode };
+      return await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: { ...baseVideo, facingMode: fm } });
+    } catch (e) { return null; }
+  }
 
   let stream = null;
   // 1) try facingMode exact
   stream = await tryByFacingMode('user', true);
   if (!stream) stream = await tryByFacingMode('user', false);
 
-  // 2) if we have stream and it's front-facing according to settings, accept
+  // 2) validate stream facingMode setting if available (prefer front)
   try {
     if (stream) {
       const vtracks = stream.getVideoTracks();
@@ -286,12 +301,15 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
         const settings = vtracks[0].getSettings ? vtracks[0].getSettings() : {};
         const facing = settings.facingMode || '';
         if (String(facing).toLowerCase() === 'user') {
-          localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (front camera)'); return stream;
+          localState.localStream = stream;
+          createLocalTile(stream);
+          setStatus('Local media active (front camera)');
+          return stream;
         }
       }
     }
 
-    // 3) enumerate devices and try to pick a front-labeled device if labels available
+    // 3) enumerate devices and try deviceId if labels are present
     const devices = await listVideoInputs();
     const hasLabels = devices.some(d => d.label && d.label.trim().length > 0);
     if (hasLabels) {
@@ -299,8 +317,11 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
       if (candidate && candidate.deviceId) {
         const byId = await tryByDeviceId(candidate.deviceId);
         if (byId) {
-          if (stream) stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} });
-          localState.localStream = byId; createLocalTile(byId); setStatus('Local media active (front camera by deviceId)'); return byId;
+          if (stream) stream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
+          localState.localStream = byId;
+          createLocalTile(byId);
+          setStatus('Local media active (front camera by deviceId)');
+          return byId;
         }
       }
     }
@@ -308,60 +329,145 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
 
   // 4) fallback: generic getUserMedia
   if (!stream) {
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: (Object.keys(baseVideo).length ? baseVideo : true) }); } catch (e) { console.error('getUserMedia fallback failed', e); throw e; }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: (Object.keys(baseVideo).length ? baseVideo : true) });
+    } catch (e) {
+      console.error('getUserMedia fallback failed', e);
+      throw e;
+    }
   }
 
-  // 5) final try to replace with front camera if possible
+  // 5) final checks & return best-effort stream
   try {
     const vtracks = stream.getVideoTracks();
-    if (!vtracks || vtracks.length === 0) { localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (no video)'); return stream; }
+    if (!vtracks || vtracks.length === 0) {
+      localState.localStream = stream;
+      createLocalTile(stream);
+      setStatus('Local media active (no video tracks)');
+      return stream;
+    }
     const settings = vtracks[0].getSettings ? vtracks[0].getSettings() : {};
     const facing = (settings && settings.facingMode) ? String(settings.facingMode).toLowerCase() : '';
-    if (facing === 'user') { localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (front camera)'); return stream; }
+    if (facing === 'user') {
+      localState.localStream = stream;
+      createLocalTile(stream);
+      setStatus('Local media active (front camera)');
+      return stream;
+    }
 
+    // try explicit deviceId fallback
     try {
       const devices2 = await listVideoInputs(); const labeled2 = devices2.filter(d => d.label && d.label.trim().length > 0);
       if (labeled2.length > 0) {
         const candidate2 = findFrontCandidate(devices2);
         if (candidate2 && candidate2.deviceId) {
           const frontStream = await tryByDeviceId(candidate2.deviceId);
-          if (frontStream) { stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); localState.localStream = frontStream; createLocalTile(frontStream); setStatus('Local media active (front camera final)'); return frontStream; }
+          if (frontStream) {
+            stream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
+            localState.localStream = frontStream;
+            createLocalTile(frontStream);
+            setStatus('Local media active (front camera final)');
+            return frontStream;
+          }
         }
       }
     } catch (e) { console.warn('Final explicit device attempt failed', e); }
 
-    localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (best-effort)'); return stream;
+    localState.localStream = stream;
+    createLocalTile(stream);
+    setStatus('Local media active (best-effort)');
+    return stream;
   } catch (err) {
     console.error('Post-acquire processing failed', err);
-    localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (post-processing error)'); return stream;
+    localState.localStream = stream;
+    createLocalTile(stream);
+    setStatus('Local media active (post-processing error)');
+    return stream;
   }
 }
 
-function setMicEnabled(enabled) { if (!localState.localStream) return; localState.localStream.getAudioTracks().forEach(t => t.enabled = !!enabled); if (el.toggleMicBtn) { el.toggleMicBtn.setAttribute('aria-pressed', String(!enabled)); el.toggleMicBtn.textContent = enabled ? '🎙️ Mic' : '🔇 Mic'; } }
-function setCamEnabled(enabled) { if (!localState.localStream) return; localState.localStream.getVideoTracks().forEach(t => t.enabled = !!enabled); if (el.toggleCamBtn) { el.toggleCamBtn.setAttribute('aria-pressed', String(!enabled)); el.toggleCamBtn.textContent = enabled ? '🎥 Cam' : '🚫 Cam'; } const localTile = document.querySelector(`#tile-${localState.peerId}`); if (localTile) localTile.dataset._hasvideo = enabled ? 'true' : 'false'; }
-
-/* ======================
-   8) Firestore helpers (presence + signals + messages)
-   ====================== */
-function roomDocRef(roomId){ return doc(db, 'rooms', roomId); }
-function peersCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'peers'); }
-function signalsCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'signals'); }
-function messagesCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'messages'); }
-
-async function writePeerPresence(roomId, peerId, meta={}) {
-  const peerRef = doc(db, 'rooms', roomId, 'peers', peerId);
-  const payload = { name: meta.name || localState.displayName || 'Guest', createdAt: serverTimestamp ? serverTimestamp() : new Date(), lastSeen: serverTimestamp ? serverTimestamp() : new Date(), peerId, online: true };
-  await setDoc(peerRef, payload, { merge:true });
+/* enable/disable mic and set aria correctly */
+function setMicEnabled(enabled) {
+  if (!localState.localStream) return;
+  localState.localStream.getAudioTracks().forEach(t => t.enabled = !!enabled);
+  if (el.toggleMicBtn) {
+    el.toggleMicBtn.setAttribute('aria-pressed', String(!!enabled));
+    el.toggleMicBtn.textContent = enabled ? '🎙️ Mic' : '🔇 Mic';
+  }
 }
 
-async function touchPeerPresence(){ if (!localState.roomId || !localState.peerId) return; try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { lastSeen: serverTimestamp ? serverTimestamp() : new Date(), online: true }, { merge:true }); } catch(e){ console.warn('touchPeerPresence failed', e); } }
-async function removePeerPresence(roomId, peerId){ try { await deleteDoc(doc(db, 'rooms', roomId, 'peers', peerId)); } catch(e){ console.warn('removePeerPresence failed', e); } }
-
-async function sendSignal(roomId, message){ try { await addDoc(signalsCollectionRef(roomId), { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() }); } catch(e){ console.error('sendSignal failed', e); } }
-async function sendChatMessage(roomId, name, text){ if (!text || !text.trim()) return; try { await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null }); } catch(e){ console.error('sendChatMessage failed', e); } }
+/* enable/disable camera and update aria and tile meta */
+function setCamEnabled(enabled) {
+  if (!localState.localStream) return;
+  localState.localStream.getVideoTracks().forEach(t => t.enabled = !!enabled);
+  if (el.toggleCamBtn) {
+    el.toggleCamBtn.setAttribute('aria-pressed', String(!!enabled));
+    el.toggleCamBtn.textContent = enabled ? '🎥 Cam' : '🚫 Cam';
+  }
+  const localTile = document.querySelector(`#tile-${localState.peerId}`);
+  if (localTile) localTile.dataset._hasvideo = enabled ? 'true' : 'false';
+}
 
 /* ======================
-   9) Peer connection helpers (replace tracks instead of duping)
+   7) Firestore helpers (safe wrappers)
+   ====================== */
+function roomDocRef(roomId) { return doc(db, 'rooms', roomId); }
+function peersCollectionRef(roomId) { return collection(db, 'rooms', roomId, 'peers'); }
+function signalsCollectionRef(roomId) { return collection(db, 'rooms', roomId, 'signals'); }
+function messagesCollectionRef(roomId) { return collection(db, 'rooms', roomId, 'messages'); }
+
+async function writePeerPresence(roomId, peerId, meta = {}) {
+  const peerRef = doc(db, 'rooms', roomId, 'peers', peerId);
+  const payload = {
+    name: meta.name || localState.displayName || 'Guest',
+    createdAt: serverTimestamp ? serverTimestamp() : new Date(),
+    lastSeen: serverTimestamp ? serverTimestamp() : new Date(),
+    peerId,
+    online: true
+  };
+  await setDoc(peerRef, payload, { merge: true });
+}
+
+async function touchPeerPresence() {
+  if (!localState.roomId || !localState.peerId) return;
+  try {
+    await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { lastSeen: serverTimestamp ? serverTimestamp() : new Date(), online: true }, { merge: true });
+  } catch (e) {
+    console.warn('touchPeerPresence failed', e);
+  }
+}
+
+async function removePeerPresence(roomId, peerId) {
+  try {
+    await deleteDoc(doc(db, 'rooms', roomId, 'peers', peerId));
+  } catch (e) {
+    console.warn('removePeerPresence failed', e);
+  }
+}
+
+/* Consistent signal format: { type: 'offer'|'answer'|'ice', from, to|'all', payload: { type, sdp } | candidate } */
+async function sendSignal(roomId, message) {
+  try {
+    // Normalize payload to be an object if SDP string was provided upstream
+    // (caller should ideally pass object)
+    const msg = { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() };
+    await addDoc(signalsCollectionRef(roomId), msg);
+  } catch (e) {
+    console.error('sendSignal failed', e);
+  }
+}
+
+async function sendChatMessage(roomId, name, text) {
+  if (!text || !text.trim()) return;
+  try {
+    await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null });
+  } catch (e) {
+    console.error('sendChatMessage failed', e);
+  }
+}
+
+/* ======================
+   8) WebRTC helpers: replace track, create pc, datachannel, signaling
    ====================== */
 function replaceOrAddTrack(pc, track, stream) {
   try {
@@ -374,67 +480,159 @@ function replaceOrAddTrack(pc, track, stream) {
     } else {
       return pc.addTrack(track, stream);
     }
-  } catch (e) { try { return pc.addTrack(track, stream); } catch(er) { console.warn('replaceOrAddTrack failed', er); } }
-}
-
-function makeNewPeerConnection(peerId, isOfferer=false) {
-  if (localState.pcMap.has(peerId)) return localState.pcMap.get(peerId);
-  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  const remoteStream = new MediaStream(); localState.remoteStreams.set(peerId, remoteStream);
-
-  // add local tracks (replace if already added)
-  if (localState.localStream) localState.localStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.localStream); } catch(e){} });
-  if (localState.screenStream) localState.screenStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.screenStream); } catch(e){} });
-
-  pc.addEventListener('track', (evt) => {
-    if (evt.streams && evt.streams[0]) { localState.remoteStreams.set(peerId, evt.streams[0]); setRemoteStreamOnTile(peerId, evt.streams[0]); }
-    else { const s = localState.remoteStreams.get(peerId) || new MediaStream(); s.addTrack(evt.track); localState.remoteStreams.set(peerId, s); setRemoteStreamOnTile(peerId, s); }
-  });
-
-  pc.addEventListener('datachannel', (evt) => setupDataChannelHandlers(peerId, evt.channel));
-
-  pc.addEventListener('icecandidate', async (evt) => { if (!evt.candidate) return; await sendSignal(localState.roomId, { type:'ice', from: localState.peerId, to: peerId, payload: evt.candidate.toJSON ? evt.candidate.toJSON() : evt.candidate }); });
-
-  pc.addEventListener('connectionstatechange', () => { console.log('pc state', peerId, pc.connectionState); });
-
-  localState.pcMap.set(peerId, pc);
-  if (isOfferer) { try { const dc = pc.createDataChannel('p2p-chat'); setupDataChannelHandlers(peerId, dc); localState.dcMap.set(peerId, dc); } catch(e){ console.warn('createDataChannel error', e); } }
-  return pc;
+  } catch (e) {
+    try { return pc.addTrack(track, stream); } catch (er) { console.warn('replaceOrAddTrack failed', er); }
+  }
 }
 
 function setupDataChannelHandlers(peerId, dc) {
+  if (!dc) return;
   dc.onopen = () => console.log('DC open', peerId);
   dc.onclose = () => console.log('DC close', peerId);
   dc.onerror = (e) => console.warn('DC err', e);
-  dc.onmessage = (evt) => { try { const data = JSON.parse(evt.data); if (data && data.type === 'chat') appendLogToChat({ name: data.name || 'Peer', text: data.text || '', ts: data.ts || Date.now(), self:false }); } catch(e){ appendLogToChat({ name: peerId, text: evt.data, ts: Date.now(), self:false }); } };
+  dc.onmessage = (evt) => {
+    try {
+      const data = JSON.parse(evt.data);
+      if (data && data.type === 'chat') appendLogToChat({ name: data.name || 'Peer', text: data.text || '', ts: data.ts || Date.now(), self: false });
+    } catch (e) {
+      appendLogToChat({ name: peerId, text: evt.data, ts: Date.now(), self: false });
+    }
+  };
 }
 
+/* Ensure all existing pc's send current local tracks (useful after re-acquiring camera) */
+async function updateLocalTracksOnAllPCs() {
+  for (const [peerId, pc] of localState.pcMap.entries()) {
+    try {
+      // Remove tracks that are ended? (We rely on replaceOrAddTrack semantics)
+      if (localState.localStream) localState.localStream.getTracks().forEach(track => replaceOrAddTrack(pc, track, localState.localStream));
+      if (localState.screenStream) localState.screenStream.getTracks().forEach(track => replaceOrAddTrack(pc, track, localState.screenStream));
+    } catch (e) {
+      console.warn('updateLocalTracksOnAllPCs issue', e);
+    }
+  }
+}
+
+/* Create RTCPeerConnection for peer (idempotent) */
+function makeNewPeerConnection(peerId, isOfferer = false) {
+  if (localState.pcMap.has(peerId)) return localState.pcMap.get(peerId);
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+  // Prepare remote stream container
+  const remoteStream = new MediaStream();
+  localState.remoteStreams.set(peerId, remoteStream);
+
+  // Add local tracks (replace if possible)
+  try {
+    if (localState.localStream) localState.localStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.localStream); } catch (e) {} });
+    if (localState.screenStream) localState.screenStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.screenStream); } catch (e) {} });
+  } catch (e) { console.warn('add local tracks to pc failed', e); }
+
+  pc.addEventListener('track', (evt) => {
+    if (evt.streams && evt.streams[0]) {
+      localState.remoteStreams.set(peerId, evt.streams[0]);
+      setRemoteStreamOnTile(peerId, evt.streams[0]);
+    } else {
+      const s = localState.remoteStreams.get(peerId) || new MediaStream();
+      s.addTrack(evt.track);
+      localState.remoteStreams.set(peerId, s);
+      setRemoteStreamOnTile(peerId, s);
+    }
+  });
+
+  pc.addEventListener('datachannel', (evt) => {
+    setupDataChannelHandlers(peerId, evt.channel);
+    localState.dcMap.set(peerId, evt.channel);
+  });
+
+  pc.addEventListener('icecandidate', async (evt) => {
+    if (!evt.candidate) return;
+    try {
+      await sendSignal(localState.roomId, { type: 'ice', from: localState.peerId, to: peerId, payload: { candidate: evt.candidate.toJSON() } });
+    } catch (e) { console.warn('send ice candidate failed', e); }
+  });
+
+  pc.addEventListener('connectionstatechange', () => {
+    console.log('pc state', peerId, pc.connectionState);
+  });
+
+  localState.pcMap.set(peerId, pc);
+
+  if (isOfferer) {
+    try {
+      const dc = pc.createDataChannel('p2p-chat');
+      setupDataChannelHandlers(peerId, dc);
+      localState.dcMap.set(peerId, dc);
+    } catch (e) {
+      console.warn('createDataChannel error', e);
+    }
+  }
+
+  return pc;
+}
+
+/* Create and send offer */
 async function createAndSendOffer(roomId, toPeerId) {
   setStatus(`Creating offer for ${toPeerId}...`);
   const pc = makeNewPeerConnection(toPeerId, true);
-  try { const offer = await pc.createOffer(); await pc.setLocalDescription(offer); await sendSignal(roomId, { type:'offer', from: localState.peerId, to: toPeerId, payload: offer.sdp || offer }); setStatus(`Offer sent to ${toPeerId}`); } catch(e){ console.error('createAndSendOffer failed', e); }
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    // send object payload consistently
+    await sendSignal(roomId, { type: 'offer', from: localState.peerId, to: toPeerId, payload: { type: offer.type, sdp: offer.sdp } });
+    setStatus(`Offer sent to ${toPeerId}`);
+  } catch (e) {
+    console.error('createAndSendOffer failed', e);
+    setStatus('Offer failed');
+  }
 }
 
+/* Handle incoming offer => create answer */
 async function handleIncomingOffer(roomId, { from, payload }) {
   setStatus(`Received offer from ${from}`);
   const pc = makeNewPeerConnection(from, false);
-  try { const desc = (typeof payload === 'string' || payload.sdp) ? { type:'offer', sdp:(payload.sdp||payload) } : payload; await pc.setRemoteDescription(desc); const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); await sendSignal(roomId, { type:'answer', from: localState.peerId, to: from, payload: answer.sdp || answer }); setStatus(`Answer sent to ${from}`); } catch(e){ console.error('handleIncomingOffer failed', e); }
+  try {
+    // normalize payload to RTCSessionDescriptionInit-like object
+    const desc = (typeof payload === 'string' || payload.sdp) ? { type: (payload.type || 'offer'), sdp: (payload.sdp || payload) } : payload;
+    await pc.setRemoteDescription(desc);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await sendSignal(roomId, { type: 'answer', from: localState.peerId, to: from, payload: { type: answer.type, sdp: answer.sdp } });
+    setStatus(`Answer sent to ${from}`);
+  } catch (e) {
+    console.error('handleIncomingOffer failed', e);
+  }
 }
 
+/* Handle incoming answer */
 async function handleIncomingAnswer({ from, payload }) {
   const pc = localState.pcMap.get(from);
   if (!pc) return console.warn('No PC for answer', from);
-  try { const desc = (typeof payload === 'string' || payload.sdp) ? { type:'answer', sdp:(payload.sdp||payload) } : payload; await pc.setRemoteDescription(desc); } catch(e){ console.error('handleIncomingAnswer failed', e); }
+  try {
+    const desc = (typeof payload === 'string' || payload.sdp) ? { type: (payload.type || 'answer'), sdp: (payload.sdp || payload) } : payload;
+    await pc.setRemoteDescription(desc);
+    setStatus(`Received answer from ${from}`);
+  } catch (e) {
+    console.error('handleIncomingAnswer failed', e);
+  }
 }
 
+/* Handle incoming ICE */
 async function handleIncomingIce({ from, payload }) {
   const pc = localState.pcMap.get(from);
   if (!pc) return console.warn('No PC for ice', from);
-  try { await pc.addIceCandidate(payload); } catch(e){ console.warn('addIceCandidate failed', e); }
+  try {
+    // payload expected { candidate: {...} } or the raw candidate object
+    const c = payload && payload.candidate ? payload.candidate : payload;
+    if (!c) return;
+    await pc.addIceCandidate(new RTCIceCandidate(c));
+  } catch (e) {
+    console.warn('addIceCandidate failed', e);
+  }
 }
 
 /* ======================
-   10) Firestore listeners (signals / peers / messages)
+   9) Firestore listeners (signals / peers / messages)
    ====================== */
 function startListeningToSignals(roomId) {
   const q = query(signalsCollectionRef(roomId), orderBy('ts'));
@@ -444,9 +642,16 @@ function startListeningToSignals(roomId) {
       const docData = change.doc.data();
       const { type, from, to, payload } = docData;
       if (!type || !from) return;
-      if (from === localState.peerId) return;
-      if (to && to !== localState.peerId && to !== 'all') return;
-      try { if (type === 'offer') await handleIncomingOffer(roomId, { from, payload }); else if (type === 'answer') await handleIncomingAnswer({ from, payload }); else if (type === 'ice') await handleIncomingIce({ from, payload }); } catch(e){ console.error('Processing signal failed', e); }
+      if (from === localState.peerId) return; // ignore our own signals
+      if (to && to !== localState.peerId && to !== 'all') return; // not addressed to us
+
+      try {
+        if (type === 'offer') await handleIncomingOffer(roomId, { from, payload });
+        else if (type === 'answer') await handleIncomingAnswer({ from, payload });
+        else if (type === 'ice') await handleIncomingIce({ from, payload });
+      } catch (e) {
+        console.error('Processing signal failed', e);
+      }
     });
   }, err => console.error('Signals listener error', err));
   localState.unsubscribers.push(unsub);
@@ -476,7 +681,7 @@ function startListeningToPeers(roomId) {
         if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e => console.error(e));
       } else if (change.type === 'removed') {
         setStatus(`Peer left: ${pid}`);
-        const pc = localState.pcMap.get(pid); if (pc) { try { pc.close(); } catch(e){} localState.pcMap.delete(pid); }
+        const pc = localState.pcMap.get(pid); if (pc) { try { pc.close(); } catch (e) {} localState.pcMap.delete(pid); }
         localState.remoteStreams.delete(pid); localState.dcMap.delete(pid); localState.peerMeta.delete(pid); removeTile(pid);
       } else if (change.type === 'modified') {
         const tileName = document.querySelector(`#tile-${pid} .name`);
@@ -484,11 +689,12 @@ function startListeningToPeers(roomId) {
       }
     });
 
-    // remove stale peers locally
+    // remove stale peers locally (safety net)
     for (const [pid, meta] of Array.from(localState.peerMeta.entries())) {
-      if (pid === localState.peerId) continue; const lastSeen = meta.lastSeenMs || meta.lastSeen || 0;
+      if (pid === localState.peerId) continue;
+      const lastSeen = meta.lastSeenMs || meta.lastSeen || 0;
       if ((Date.now() - (lastSeen || Date.now())) > PRESENCE_TIMEOUT_MS) {
-        const pc = localState.pcMap.get(pid); if (pc) { try { pc.close(); } catch(e){} localState.pcMap.delete(pid); }
+        const pc = localState.pcMap.get(pid); if (pc) { try { pc.close(); } catch (e) {} localState.pcMap.delete(pid); }
         removeTile(pid); localState.peerMeta.delete(pid); localState.remoteStreams.delete(pid); localState.dcMap.delete(pid);
       }
     }
@@ -502,18 +708,23 @@ function startListeningToPeers(roomId) {
 function startListeningToMessages(roomId) {
   const q = query(messagesCollectionRef(roomId), orderBy('ts'));
   const unsub = onSnapshot(q, (snapshot) => {
-    snapshot.docChanges().forEach(change => { if (change.type !== 'added') return; const msg = change.doc.data(); appendLogToChat({ name: msg.name || 'Anon', text: msg.text || '', ts: (msg.ts && msg.ts.toMillis) ? msg.ts.toMillis() : (msg.ts || Date.now()), self: msg.from === localState.peerId }); });
+    snapshot.docChanges().forEach(change => {
+      if (change.type !== 'added') return;
+      const msg = change.doc.data();
+      appendLogToChat({ name: msg.name || 'Anon', text: msg.text || '', ts: (msg.ts && msg.ts.toMillis) ? msg.ts.toMillis() : (msg.ts || Date.now()), self: msg.from === localState.peerId });
+    });
   }, err => console.error('Messages listener error', err));
   localState.unsubscribers.push(unsub);
   return unsub;
 }
 
 /* ======================
-   11) Cleanup helpers: when last user leaves, remove signals/messages/room (best-effort)
+   10) Cleanup helpers
    ====================== */
 async function cleanupRoomIfEmpty(roomId) {
   if (!roomId) return;
   try {
+    // small delay to let presence settle
     await new Promise(res => setTimeout(res, 200));
     const peersSnap = await getDocs(peersCollectionRef(roomId));
     if (!peersSnap || peersSnap.empty) {
@@ -528,11 +739,13 @@ async function cleanupRoomIfEmpty(roomId) {
     } else {
       console.log('Room not empty — skip cleanup:', roomId, peersSnap.size);
     }
-  } catch (e) { console.warn('cleanupRoomIfEmpty failed', e); }
+  } catch (e) {
+    console.warn('cleanupRoomIfEmpty failed', e);
+  }
 }
 
 /* ======================
-   12) Join / Leave flows + auto-nickname
+   11) Join / Leave flows + auto-nickname
    ====================== */
 async function pickAutoDisplayName(roomId) {
   try {
@@ -543,47 +756,74 @@ async function pickAutoDisplayName(roomId) {
       if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) active++;
     });
     return `Participant ${active + 1}`;
-  } catch (e) { console.warn('pickAutoDisplayName failed', e); return `Participant${Math.floor(Math.random()*1000)}`; }
+  } catch (e) {
+    console.warn('pickAutoDisplayName failed', e);
+    return `Participant${Math.floor(Math.random() * 1000)}`;
+  }
 }
 
 async function joinRoom(roomIdInput) {
   if (localState._joined) { setStatus('Already in a room'); return; }
-  const roomId = (roomIdInput && String(roomIdInput).trim()) || (window.location.hash ? window.location.hash.replace('#','') : '');
+  const roomId = (roomIdInput && String(roomIdInput).trim()) || (window.location.hash ? window.location.hash.replace('#', '') : '');
   if (!roomId) { setStatus('Please enter a Room ID before joining'); return; }
 
-  localState.roomId = roomId; localState.peerId = genId('p-');
+  localState.roomId = roomId;
+  localState.peerId = genId('p-');
   const dn = el.displayNameInput && el.displayNameInput.value;
   if (dn && dn.trim()) localState.displayName = dn.trim();
-  else { try { const auto = await pickAutoDisplayName(roomId); localState.displayName = auto; if (el.displayNameInput) el.displayNameInput.value = auto; } catch(e) { console.warn(e); } }
+  else {
+    try {
+      const auto = await pickAutoDisplayName(roomId);
+      localState.displayName = auto;
+      if (el.displayNameInput) el.displayNameInput.value = auto;
+    } catch (e) { console.warn(e); }
+  }
 
   setStatus(`Joining ${roomId} as ${localState.peerId} (${localState.displayName})`);
 
-  try { const href = new URL(window.location.href); href.hash = roomId; if (el.shareUrl) el.shareUrl.textContent = href.toString(); } catch(e){ if (el.shareUrl) el.shareUrl.textContent = `${window.location.href}#${roomId}`; }
+  // update share URL display if element exists
+  try { const href = new URL(window.location.href); href.hash = roomId; if (el.shareUrl) { el.shareUrl.textContent = href.toString(); el.shareUrl.classList.remove('visually-hidden'); } } catch(e){ if (el.shareUrl) { el.shareUrl.textContent = `${window.location.href}#${roomId}`; el.shareUrl.classList.remove('visually-hidden'); } }
 
-  // get local media, but don't block join if user denies (we still join)
-  try { await ensureLocalStream(); } catch(e) { console.warn('No local media available.'); }
+  // best-effort get local media (do not block join entirely if user denies)
+  try { await ensureLocalStream(); } catch (e) { console.warn('No local media available. Continue joining without camera.'); setStatus('Joined (no local media)'); }
 
-  try { await writePeerPresence(roomId, localState.peerId, { name: localState.displayName }); } catch(e) { console.error('Failed to write presence', e); setStatus('Failed to join (Firestore error)'); return; }
+  // write presence doc
+  try {
+    await writePeerPresence(roomId, localState.peerId, { name: localState.displayName });
+  } catch (e) {
+    console.error('Failed to write presence', e);
+    setStatus('Failed to join (Firestore error)');
+    return;
+  }
 
-  startListeningToPeers(roomId); startListeningToSignals(roomId); startListeningToMessages(roomId);
+  // start listeners
+  startListeningToPeers(roomId);
+  startListeningToSignals(roomId);
+  startListeningToMessages(roomId);
 
+  // pre-offer existing peers in room snapshot
   try {
     const peersSnap = await getDocs(peersCollectionRef(roomId));
     peersSnap.forEach(docSnap => {
-      const data = docSnap.data(); const pid = data.peerId || docSnap.id; if (pid === localState.peerId) return;
+      const data = docSnap.data(); const pid = data.peerId || docSnap.id;
+      if (pid === localState.peerId) return;
       const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
-      if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) { if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e=>console.error(e)); }
+      if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) {
+        if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e => console.error(e));
+      }
     });
-  } catch(e) { console.warn('Pre-offer check failed', e); }
+  } catch (e) { console.warn('Pre-offer check failed', e); }
 
   localState._joined = true;
-  if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = false; if (el.createRoomBtn) el.createRoomBtn.disabled = true;
+  if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = false;
+  if (el.createRoomBtn) el.createRoomBtn.disabled = true;
   setStatus(`Joined ${roomId}`);
 
-  startPresenceHeartbeat(); startVideoStatePolling();
+  startPresenceHeartbeat();
+  startVideoStatePolling();
 
   if (localState._autoJoinedFromHash && el.roomControlsSection) {
-    try { el.roomControlsSection.style.display = 'none'; const b = ensureShowControlsButton(); b.style.display = 'inline-block'; } catch(e){}
+    try { el.roomControlsSection.style.display = 'none'; const b = ensureShowControlsButton(); b.style.display = 'inline-block'; } catch (e) {}
     if (localState._removeHashAfterAutoJoin) try { history.replaceState(null, '', location.pathname + location.search); } catch(e){}
   }
 }
@@ -591,17 +831,21 @@ async function joinRoom(roomIdInput) {
 async function leaveRoom() {
   if (!localState._joined) { setStatus('Not in a room'); return; }
   const roomId = localState.roomId; setStatus('Leaving room...');
-  for (const [peerId, pc] of localState.pcMap.entries()) { try { pc.close(); } catch(e){} }
+
+  // close pc's
+  for (const [peerId, pc] of localState.pcMap.entries()) { try { pc.close(); } catch (e) {} }
   localState.pcMap.clear(); localState.dcMap.clear();
+
   stopPresenceHeartbeat(); stopVideoStatePolling();
 
   if (roomId && localState.peerId) {
-    try { await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online:false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge:true }); } catch(e) { console.warn('mark offline failed', e); }
-    try { await removePeerPresence(roomId, localState.peerId); } catch(e) { console.warn('remove presence failed', e); }
-    try { await cleanupRoomIfEmpty(roomId); } catch(e) { console.warn('cleanup attempt failed', e); }
+    try { await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true }); } catch (e) { console.warn('mark offline failed', e); }
+    try { await removePeerPresence(roomId, localState.peerId); } catch (e) { console.warn('remove presence failed', e); }
+    try { await cleanupRoomIfEmpty(roomId); } catch (e) { console.warn('cleanup attempt failed', e); }
   }
 
-  localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e){} }); localState.unsubscribers = [];
+  localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e) {} }); localState.unsubscribers = [];
+
   if (el.videos) { const tiles = Array.from(el.videos.querySelectorAll('.vid')); tiles.forEach(t => t.remove()); }
   if (localState.localStream) { localState.localStream.getTracks().forEach(t => t.stop()); localState.localStream = null; }
   if (localState.screenStream) { localState.screenStream.getTracks().forEach(t => t.stop()); localState.screenStream = null; }
@@ -617,14 +861,14 @@ async function leaveRoom() {
   updateParticipantsClass();
 }
 
-/* best-effort cleanup on unload (only on actual unload/navigation) */
+/* Best-effort cleanup on unload (async may not complete) */
 async function tryCleanupOnUnload() {
   stopVideoStatePolling(); stopPresenceHeartbeat();
   try {
     if (localState.roomId && localState.peerId) {
-      try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online:false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge:true }); } catch(e) { console.warn('presence set failed on unload', e); }
-      try { await removePeerPresence(localState.roomId, localState.peerId); } catch(e) { console.warn('removePeerPresence failed on unload', e); }
-      try { await cleanupRoomIfEmpty(localState.roomId); } catch(e) { console.warn('cleanup on unload failed', e); }
+      try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true }); } catch (e) { console.warn('presence set failed on unload', e); }
+      try { await removePeerPresence(localState.roomId, localState.peerId); } catch (e) { console.warn('removePeerPresence failed on unload', e); }
+      try { await cleanupRoomIfEmpty(localState.roomId); } catch (e) { console.warn('cleanup on unload failed', e); }
     }
   } catch (err) { console.warn('tryCleanupOnUnload error', err); }
   if (localState.localStream) localState.localStream.getTracks().forEach(t => t.stop());
@@ -635,63 +879,99 @@ window.addEventListener('beforeunload', (ev) => { tryCleanupOnUnload(); });
 window.addEventListener('pagehide', (ev) => { if (!ev.persisted) tryCleanupOnUnload(); });
 
 /* ======================
-   13) Presence heartbeat
+   12) Presence heartbeat
    ====================== */
-function startPresenceHeartbeat() { if (localState._presenceHeartbeatInterval) return; touchPeerPresence().catch(()=>{}); localState._presenceHeartbeatInterval = setInterval(() => { touchPeerPresence().catch(()=>{}); }, PRESENCE_HEARTBEAT_MS); }
-function stopPresenceHeartbeat() { if (localState._presenceHeartbeatInterval) { clearInterval(localState._presenceHeartbeatInterval); localState._presenceHeartbeatInterval = null; } }
+function startPresenceHeartbeat() {
+  if (localState._presenceHeartbeatInterval) return;
+  touchPeerPresence().catch(()=>{});
+  localState._presenceHeartbeatInterval = setInterval(() => { touchPeerPresence().catch(()=>{}); }, PRESENCE_HEARTBEAT_MS);
+}
+function stopPresenceHeartbeat() {
+  if (localState._presenceHeartbeatInterval) {
+    clearInterval(localState._presenceHeartbeatInterval);
+    localState._presenceHeartbeatInterval = null;
+  }
+}
 
 /* ======================
-   14) Screen share
+   13) Screen share
    ====================== */
 async function startScreenShare() {
   if (!navigator.mediaDevices.getDisplayMedia) { setStatus('Screen share not supported'); return; }
   try {
-    const screenStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:false });
-    localState.screenStream = screenStream; const screenTileId = `screen-${localState.peerId || 'local'}`; addRemoteTile(screenTileId, `${localState.displayName} (screen)`);
+    const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    localState.screenStream = screenStream;
+    const screenTileId = `screen-${localState.peerId || 'local'}`;
+    addRemoteTile(screenTileId, `${localState.displayName} (screen)`);
     const videoEl = document.querySelector(`#tile-${screenTileId} video`); if (videoEl) videoEl.srcObject = screenStream;
+
     for (const [peerId, pc] of localState.pcMap.entries()) {
       const senders = pc.getSenders().filter(s => s.track && s.track.kind === 'video');
-      if (senders.length > 0) { try { await senders[0].replaceTrack(screenStream.getVideoTracks()[0]); } catch(e) { try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e){} } }
-      else { try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e){} }
+      if (senders.length > 0) {
+        try { await senders[0].replaceTrack(screenStream.getVideoTracks()[0]); } catch (e) { try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e){} }
+      } else {
+        try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e){}
+      }
     }
+
     screenStream.getVideoTracks()[0].addEventListener('ended', async () => {
       removeTile(screenTileId);
       if (localState.localStream && localState.localStream.getVideoTracks().length > 0) {
         for (const [peerId, pc] of localState.pcMap.entries()) {
-          const senders = pc.getSenders().filter(s => s.track && s.track.kind === 'video'); if (senders.length > 0) { try { await senders[0].replaceTrack(localState.localStream.getVideoTracks()[0]); } catch(e) { console.warn(e); } }
+          const senders = pc.getSenders().filter(s => s.track && s.track.kind === 'video');
+          if (senders.length > 0) { try { await senders[0].replaceTrack(localState.localStream.getVideoTracks()[0]); } catch (e) { console.warn(e); } }
         }
       }
       localState.screenStream = null;
     });
+
     setStatus('You are sharing your screen');
-  } catch(e) { console.error('startScreenShare failed', e); setStatus('Failed to share screen'); }
+  } catch (e) {
+    console.error('startScreenShare failed', e);
+    setStatus('Failed to share screen');
+  }
 }
 
 /* ======================
-   15) Chat wiring
+   14) Chat wiring
    ====================== */
 if (el.chatForm) {
-  el.chatForm.addEventListener('submit', async (ev) => { ev.preventDefault(); const text = el.chatInput.value || ''; if (!localState.roomId) { setStatus('Not in a room — chat not sent'); return; } await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text); appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self:true }); el.chatInput.value = ''; });
-  if (el.sendChatBtn) el.sendChatBtn.addEventListener('click', () => el.chatForm.dispatchEvent(new Event('submit', { cancelable:true })));
+  el.chatForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const text = el.chatInput.value || '';
+    if (!localState.roomId) { setStatus('Not in a room — chat not sent'); return; }
+    await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text);
+    appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
+    el.chatInput.value = '';
+  });
+  if (el.sendChatBtn) el.sendChatBtn.addEventListener('click', () => el.chatForm.dispatchEvent(new Event('submit', { cancelable: true })));
 }
 
 /* ======================
-   16) Controls wiring
+   15) Controls wiring
    ====================== */
 if (el.createRoomBtn) el.createRoomBtn.addEventListener('click', () => joinRoom(el.roomIdInput.value.trim()).catch(console.error));
 if (el.leaveRoomBtn) el.leaveRoomBtn.addEventListener('click', () => leaveRoom().catch(console.error));
-if (el.toggleMicBtn) el.toggleMicBtn.addEventListener('click', () => { if (!localState.localStream) return; const enabled = localState.localStream.getAudioTracks().some(t=>t.enabled); setMicEnabled(!enabled); });
-if (el.toggleCamBtn) el.toggleCamBtn.addEventListener('click', () => { if (!localState.localStream) return; const enabled = localState.localStream.getVideoTracks().some(t=>t.enabled); setCamEnabled(!enabled); });
+if (el.toggleMicBtn) el.toggleMicBtn.addEventListener('click', () => { if (!localState.localStream) return; const enabled = localState.localStream.getAudioTracks().some(t => t.enabled); setMicEnabled(!enabled); });
+if (el.toggleCamBtn) el.toggleCamBtn.addEventListener('click', () => { if (!localState.localStream) return; const enabled = localState.localStream.getVideoTracks().some(t => t.enabled); setCamEnabled(!enabled); });
 if (el.shareScreenBtn) el.shareScreenBtn.addEventListener('click', () => startScreenShare().catch(console.error));
-if (el.displayNameInput) el.displayNameInput.addEventListener('change', async () => { const nm = el.displayNameInput.value.trim() || 'Guest'; localState.displayName = nm; if (localState.roomId && localState.peerId) try { await writePeerPresence(localState.roomId, localState.peerId, { name: nm }); } catch(e){ console.warn(e); } });
+if (el.displayNameInput) el.displayNameInput.addEventListener('change', async () => {
+  const nm = el.displayNameInput.value.trim() || 'Guest';
+  localState.displayName = nm;
+  if (localState.roomId && localState.peerId) try { await writePeerPresence(localState.roomId, localState.peerId, { name: nm }); } catch(e){ console.warn(e); }
+});
 
 /* ======================
-   17) Initial preview attempt
+   16) Initial preview attempt (non-blocking)
    ====================== */
-(async function tryInitPreview(){ try { if (!localState.localStream) { await ensureLocalStream({ audio:true, video:{ width:640, height:360 } }); setMicEnabled(true); setCamEnabled(true); } } catch(e){ console.debug('Initial preview unavailable', e); } })();
+(async function tryInitPreview() {
+  try {
+    if (!localState.localStream) { await ensureLocalStream({ audio: true, video: { width: 640, height: 360 } }); setMicEnabled(true); setCamEnabled(true); }
+  } catch (e) { console.debug('Initial preview unavailable', e); }
+})();
 
 /* ======================
-   18) Fit & layout helpers
+   17) Layout helpers (fit + grid)
    ====================== */
 function fitVideosToViewport() {
   try {
@@ -699,7 +979,7 @@ function fitVideosToViewport() {
     const top = header ? header.getBoundingClientRect().height : 0; const roomH = roomControls ? roomControls.getBoundingClientRect().height : 0; const controlsH = controls ? controls.getBoundingClientRect().height : 0; const footerH = footer ? footer.getBoundingClientRect().height : 0; const extras = 32; const vh = window.innerHeight; const available = Math.max(160, Math.floor(vh - (top + roomH + controlsH + footerH + extras)));
     document.documentElement.style.setProperty('--videos-max-h', `${available}px`);
     const videosEl = document.querySelector('.videos'); if (videosEl) videosEl.style.overflowY = (available < 260) ? 'auto' : 'hidden';
-  } catch(e) { console.warn('fitVideosToViewport error', e); }
+  } catch (e) { console.warn('fitVideosToViewport error', e); }
 }
 
 function layoutVideoGrid() {
@@ -709,9 +989,27 @@ function layoutVideoGrid() {
     const containerRect = videosEl.getBoundingClientRect(); const containerWidth = containerRect.width && containerRect.width > 0 ? containerRect.width : (window.innerWidth - (document.querySelector('.sidebar') ? document.querySelector('.sidebar').getBoundingClientRect().width : 0) - 40);
     const aspectRatio = 16/9; let best = { cols:1, rows:N, tileWidth:containerWidth, tileHeight:Math.floor(containerWidth/aspectRatio), totalHeight: Math.ceil(N)*Math.floor(containerWidth/aspectRatio), fits:false, overflow: Infinity };
     const gap = parseFloat(getComputedStyle(videosEl).gap || 12); const maxCols = Math.min(N, Math.max(1, Math.floor(containerWidth / 160)));
-    for (let cols=1; cols<=maxCols; cols++) { const tileW = (containerWidth - (cols - 1) * gap) / cols; const tileH = tileW / aspectRatio; const rows = Math.ceil(N / cols); const totalH = rows * tileH + (rows - 1) * gap; const overflow = Math.max(0, totalH - availableHeight); const fits = totalH <= availableHeight; if (fits) { if (!best.fits || tileH > best.tileHeight) best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits, overflow }; } else { if (!best.fits) { if (overflow < best.overflow || (Math.abs(overflow - best.overflow) < 1 && tileH > best.tileHeight)) { best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits:false, overflow }; } } } }
-    const minTileH = 100; const tileHpx = Math.max(minTileH, Math.floor(best.tileHeight)); const colsToUse = best.cols; videosEl.style.gridTemplateColumns = `repeat(${colsToUse}, 1fr)`; videosEl.style.setProperty('--tile-height', `${tileHpx}px`); videosEl.style.setProperty('--videos-max-h', `${availableHeight}px`); tiles.forEach(t => { t.style.height = `${tileHpx}px`; }); videosEl.style.overflowY = best.fits ? 'hidden' : 'auto'; const statusEl = document.querySelector('#status'); if (statusEl) statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${best.rows} • ${best.fits ? 'fit' : 'scroll'}`;
-  } catch(e) { console.warn('layoutVideoGrid error', e); }
+    for (let cols=1; cols<=maxCols; cols++) {
+      const tileW = (containerWidth - (cols - 1) * gap) / cols; const tileH = tileW / aspectRatio; const rows = Math.ceil(N / cols); const totalH = rows * tileH + (rows - 1) * gap; const overflow = Math.max(0, totalH - availableHeight); const fits = totalH <= availableHeight;
+      if (fits) {
+        if (!best.fits || tileH > best.tileHeight) best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits, overflow };
+      } else {
+        if (!best.fits) {
+          if (overflow < best.overflow || (Math.abs(overflow - best.overflow) < 1 && tileH > best.tileHeight)) {
+            best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits:false, overflow };
+          }
+        }
+      }
+    }
+    const minTileH = 100; const tileHpx = Math.max(minTileH, Math.floor(best.tileHeight)); const colsToUse = best.cols;
+    videosEl.style.gridTemplateColumns = `repeat(${colsToUse}, 1fr)`;
+    videosEl.style.setProperty('--tile-height', `${tileHpx}px`);
+    videosEl.style.setProperty('--videos-max-h', `${availableHeight}px`);
+    tiles.forEach(t => { t.style.height = `${tileHpx}px`; });
+    videosEl.style.overflowY = best.fits ? 'hidden' : 'auto';
+    const statusEl = document.querySelector('#status');
+    if (statusEl) statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${best.rows} • ${best.fits ? 'fit' : 'scroll'}`;
+  } catch (e) { console.warn('layoutVideoGrid error', e); }
 }
 
 window.addEventListener('load', ()=>{ fitVideosToViewport(); setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
@@ -719,33 +1017,85 @@ window.addEventListener('resize', ()=>{ fitVideosToViewport(); layoutVideoGrid()
 window.addEventListener('orientationchange', ()=>{ setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
 
 /* ======================
-   19) Visibility rules
+   18) Visibility rules & video detection
    ====================== */
 function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES) {
   try {
     const videosEl = document.querySelector('.videos'); if (!videosEl) return; const tiles = Array.from(videosEl.querySelectorAll('.vid')); const total = tiles.length;
     if (total <= maxVisible) { tiles.forEach(t => { t.classList.remove('hidden-by-limit'); t.style.display=''; t.setAttribute('aria-hidden','false'); }); setStatus(`${total} participants`); layoutVideoGrid(); return; }
-    const infos = tiles.map(t => { const peer = t.dataset.peer || t.id || ''; const isLocal = t.classList.contains('local') || peer === localState.peerId; const hasVideo = (t.dataset._hasvideo === 'true'); const meta = localState.peerMeta.get(peer) || {}; const createdAtMs = meta.createdAtMs || 0; return { tileEl:t, peer, isLocal, hasVideo, createdAtMs }; });
-    infos.sort((a,b) => { if (a.isLocal && !b.isLocal) return -1; if (!a.isLocal && b.isLocal) return 1; if (a.hasVideo && !b.hasVideo) return -1; if (!a.hasVideo && b.hasVideo) return 1; return (a.createdAtMs || 0) - (b.createdAtMs || 0); });
-    const visible = infos.slice(0, maxVisible); const visiblePeers = new Set(visible.map(i => i.peer)); infos.forEach(info => { const tile = info.tileEl; if (visiblePeers.has(info.peer)) { tile.classList.remove('hidden-by-limit'); tile.style.display=''; tile.setAttribute('aria-hidden','false'); } else { tile.classList.add('hidden-by-limit'); tile.style.display='none'; tile.setAttribute('aria-hidden','true'); } });
-    const hiddenCount = total - visiblePeers.size; setStatus(`${total} participants • ${hiddenCount} hidden`); layoutVideoGrid();
-  } catch(e) { console.warn('applyVisibilityRules error', e); }
+    const infos = tiles.map(t => {
+      const peer = t.dataset.peer || t.id || '';
+      const isLocal = t.classList.contains('local') || peer === localState.peerId;
+      const hasVideo = (t.dataset._hasvideo === 'true');
+      const meta = localState.peerMeta.get(peer) || {};
+      const createdAtMs = meta.createdAtMs || 0;
+      return { tileEl: t, peer, isLocal, hasVideo, createdAtMs };
+    });
+    infos.sort((a,b) => {
+      if (a.isLocal && !b.isLocal) return -1;
+      if (!a.isLocal && b.isLocal) return 1;
+      if (a.hasVideo && !b.hasVideo) return -1;
+      if (!a.hasVideo && b.hasVideo) return 1;
+      return (a.createdAtMs || 0) - (b.createdAtMs || 0);
+    });
+    const visible = infos.slice(0, maxVisible);
+    const visiblePeers = new Set(visible.map(i => i.peer));
+    infos.forEach(info => {
+      const tile = info.tileEl;
+      if (visiblePeers.has(info.peer)) {
+        tile.classList.remove('hidden-by-limit'); tile.style.display=''; tile.setAttribute('aria-hidden','false');
+      } else {
+        tile.classList.add('hidden-by-limit'); tile.style.display='none'; tile.setAttribute('aria-hidden','true');
+      }
+    });
+    const hiddenCount = total - visiblePeers.size;
+    setStatus(`${total} participants • ${hiddenCount} hidden`);
+    layoutVideoGrid();
+  } catch (e) { console.warn('applyVisibilityRules error', e); }
 }
 
 function detectVideoStateAndApply(maxVisible = MAX_VISIBLE_TILES) {
-  try { const videosEl = document.querySelector('.videos'); if (!videosEl) return; const tiles = Array.from(videosEl.querySelectorAll('.vid')); let changed = false; for (const t of tiles) { const videoEl = t.querySelector('video'); let hasVideo = false; try { if (videoEl && videoEl.srcObject) { const vtracks = (videoEl.srcObject.getVideoTracks && videoEl.srcObject.getVideoTracks()) || []; hasVideo = vtracks.some(tr => tr && tr.enabled !== false); } } catch(e) { hasVideo = false; } const prev = t.dataset._hasvideo === 'true'; if (prev !== hasVideo) { t.dataset._hasvideo = hasVideo ? 'true' : 'false'; changed = true; } } if (changed) applyVisibilityRules(maxVisible); } catch(e) { console.warn('detectVideoStateAndApply error', e); }
+  try {
+    const videosEl = document.querySelector('.videos'); if (!videosEl) return;
+    const tiles = Array.from(videosEl.querySelectorAll('.vid'));
+    let changed = false;
+    for (const t of tiles) {
+      const videoEl = t.querySelector('video');
+      let hasVideo = false;
+      try {
+        if (videoEl && videoEl.srcObject) {
+          const vtracks = (videoEl.srcObject.getVideoTracks && videoEl.srcObject.getVideoTracks()) || [];
+          hasVideo = vtracks.some(tr => tr && tr.enabled !== false && (tr.readyState !== 'ended'));
+        }
+      } catch (e) { hasVideo = false; }
+      const prev = t.dataset._hasvideo === 'true';
+      if (prev !== hasVideo) { t.dataset._hasvideo = hasVideo ? 'true' : 'false'; changed = true; }
+    }
+    if (changed) applyVisibilityRules(maxVisible);
+  } catch (e) { console.warn('detectVideoStateAndApply error', e); }
 }
 
-function startVideoStatePolling(){ if (localState._videoDetectInterval) return; localState._videoDetectInterval = setInterval(()=> detectVideoStateAndApply(MAX_VISIBLE_TILES), 1200); }
-function stopVideoStatePolling(){ if (localState._videoDetectInterval) { clearInterval(localState._videoDetectInterval); localState._videoDetectInterval = null; } }
+function startVideoStatePolling() {
+  if (localState._videoDetectInterval) return;
+  localState._videoDetectInterval = setInterval(()=> detectVideoStateAndApply(MAX_VISIBLE_TILES), VIDEO_POLL_INTERVAL_MS);
+}
+function stopVideoStatePolling() {
+  if (localState._videoDetectInterval) {
+    clearInterval(localState._videoDetectInterval);
+    localState._videoDetectInterval = null;
+  }
+}
 
 /* ======================
-   20) Shortcuts & debug
+   19) Shortcuts & debug
    ====================== */
-window.addEventListener('keydown', (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'm') { ev.preventDefault(); if (localState.localStream) setMicEnabled(!localState.localStream.getAudioTracks().some(t=>t.enabled)); } if ((ev.ctrlKey || ev.metaKey) && ev.key === 'e') { ev.preventDefault(); if (localState.localStream) setCamEnabled(!localState.localStream.getVideoTracks().some(t=>t.enabled)); } });
+window.addEventListener('keydown', (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'm') { ev.preventDefault(); if (localState.localStream) setMicEnabled(!localState.localStream.getAudioTracks().some(t=>t.enabled)); }
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'e') { ev.preventDefault(); if (localState.localStream) setCamEnabled(!localState.localStream.getVideoTracks().some(t=>t.enabled)); }
+});
 
 /* ======================
-   21) Auto-join from hash
+   20) Auto-join from hash
    ====================== */
 function tryAutoJoinFromHash() {
   try {
@@ -756,13 +1106,43 @@ function tryAutoJoinFromHash() {
     setTimeout(() => {
       joinRoom(raw).then(()=>{ console.log('Auto-joined room', raw); }).catch(err => { console.error('Auto-join failed', err); localState._autoJoinedFromHash = false; if (el.roomControlsSection) el.roomControlsSection.style.display = ''; });
     }, 300);
-  } catch(e) { console.warn('tryAutoJoinFromHash error', e); }
+  } catch (e) { console.warn('tryAutoJoinFromHash error', e); }
 }
 window.addEventListener('load', ()=> setTimeout(()=> tryAutoJoinFromHash(), 300));
 
 /* ======================
-   Export for console debugging
+   21) Small helpers
    ====================== */
-window._pakelmeet = { localState, joinRoom, leaveRoom, setStatus, sendChatMessage, applyVisibilityRules, layoutVideoGrid };
+function genId(pref) { return pref + Math.random().toString(36).slice(2,9); }
+function ensureShowControlsButton() {
+  let b = $('#showControlsBtn');
+  if (b) return b;
+  b = document.createElement('button');
+  b.id = 'showControlsBtn';
+  b.textContent = 'Show room controls';
+  b.style.position = 'fixed'; b.style.bottom = '12px'; b.style.left = '12px'; b.style.zIndex = '9999';
+  b.style.padding = '8px 12px'; b.style.borderRadius = '8px';
+  b.addEventListener('click', () => {
+    if (el.roomControlsSection) el.roomControlsSection.style.display = '';
+    b.style.display = 'none';
+  });
+  document.body.appendChild(b);
+  return b;
+}
+
+/* ======================
+   22) Expose for debugging in console
+   ====================== */
+window._pakelmeet = {
+  localState,
+  joinRoom,
+  leaveRoom,
+  setStatus,
+  sendChatMessage,
+  applyVisibilityRules,
+  layoutVideoGrid,
+  ensureLocalStream,
+  updateLocalTracksOnAllPCs
+};
 
 /* End of file */
