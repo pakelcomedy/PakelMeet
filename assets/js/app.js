@@ -1122,44 +1122,6 @@ function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES) {
   }
 }
 
-/* ======================
-   18) Visibility rules & video detection
-   ====================== */
-function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES) {
-  try {
-    const videosEl = document.querySelector('.videos'); if (!videosEl) return; const tiles = Array.from(videosEl.querySelectorAll('.vid')); const total = tiles.length;
-    if (total <= maxVisible) { tiles.forEach(t => { t.classList.remove('hidden-by-limit'); t.style.display=''; t.setAttribute('aria-hidden','false'); }); setStatus(`${total} participants`); layoutVideoGrid(); return; }
-    const infos = tiles.map(t => {
-      const peer = t.dataset.peer || t.id || '';
-      const isLocal = t.classList.contains('local') || peer === localState.peerId;
-      const hasVideo = (t.dataset._hasvideo === 'true');
-      const meta = localState.peerMeta.get(peer) || {};
-      const createdAtMs = meta.createdAtMs || 0;
-      return { tileEl: t, peer, isLocal, hasVideo, createdAtMs };
-    });
-    infos.sort((a,b) => {
-      if (a.isLocal && !b.isLocal) return -1;
-      if (!a.isLocal && b.isLocal) return 1;
-      if (a.hasVideo && !b.hasVideo) return -1;
-      if (!a.hasVideo && b.hasVideo) return 1;
-      return (a.createdAtMs || 0) - (b.createdAtMs || 0);
-    });
-    const visible = infos.slice(0, maxVisible);
-    const visiblePeers = new Set(visible.map(i => i.peer));
-    infos.forEach(info => {
-      const tile = info.tileEl;
-      if (visiblePeers.has(info.peer)) {
-        tile.classList.remove('hidden-by-limit'); tile.style.display=''; tile.setAttribute('aria-hidden','false');
-      } else {
-        tile.classList.add('hidden-by-limit'); tile.style.display='none'; tile.setAttribute('aria-hidden','true');
-      }
-    });
-    const hiddenCount = total - visiblePeers.size;
-    setStatus(`${total} participants • ${hiddenCount} hidden`);
-    layoutVideoGrid();
-  } catch (e) { console.warn('applyVisibilityRules error', e); }
-}
-
 function detectVideoStateAndApply(maxVisible = MAX_VISIBLE_TILES) {
   try {
     const videosEl = document.querySelector('.videos'); if (!videosEl) return;
