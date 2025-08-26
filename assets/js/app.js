@@ -7,8 +7,7 @@
    - Best-effort video.play() handling
    - Proper aria-pressed semantics
    - Clean room join/leave with presence heartbeat + best-effort cleanup
-   - Defensive checks for missing DOM elements
-   - Helpful console export for debugging
+   - Defensive checks for missing DOM elements + Firestore fallback
    ========================================================== */
 
 /* ======================
@@ -36,29 +35,49 @@ const firebaseConfig = {
   measurementId: "G-CHH9NJEB9J"
 };
 
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-const auth = getAuth(app);
+let FIRESTORE_ENABLED = true; // optimistic; flipped to false on auth failure / config error
 
-/* anonymous sign-in */
+let app, db, auth;
+try {
+  app = initializeApp(firebaseConfig);
+  db = getFirestore(app);
+  auth = getAuth(app);
+} catch (e) {
+  console.warn('Firebase initialization failed — Firestore disabled', e);
+  FIRESTORE_ENABLED = false;
+}
+
+/* anonymous sign-in (guarded) */
 let currentUser = null;
-signInAnonymously(auth).catch(err => console.warn('Firebase anon sign-in failed', err));
-onAuthStateChanged(auth, user => { currentUser = user; console.log('Auth changed -> anon?', !!user); });
+if (FIRESTORE_ENABLED && auth) {
+  signInAnonymously(auth).catch(err => {
+    console.warn('Firebase anon sign-in failed', err);
+    FIRESTORE_ENABLED = false;
+    setStatus('Warning: Firebase auth failed — running local-only');
+  });
+  onAuthStateChanged(auth, user => {
+    currentUser = user;
+    console.log('Auth changed -> anon?', !!user);
+    if (!user) {
+      // Could be failure or not signed in yet. Keep FIRESTORE_ENABLED as-is.
+    }
+  });
+} else {
+  console.log('Firestore disabled — running in local-only preview mode');
+}
 
 /* ======================
    3) App constants & state
    ====================== */
-// Replace/add TURN servers here for production reliability.
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
-  // Example TURN (replace with your own provider)
-  // { urls: 'turn:turn.example.com:3478', username: 'user', credential: 'pass' }
+  // Add TURN here as needed for production
 ];
 
-const PRESENCE_HEARTBEAT_MS = 5000;   // heartbeat interval
-const PRESENCE_TIMEOUT_MS = 15000;    // consider stale peers older than this
-const MAX_VISIBLE_TILES = 4;          // number of visible tiles before hiding extras
-const VIDEO_POLL_INTERVAL_MS = 1200;  // detect video state periodically
+const PRESENCE_HEARTBEAT_MS = 5000;
+const PRESENCE_TIMEOUT_MS = 15000;
+const MAX_VISIBLE_TILES = 4;
+const VIDEO_POLL_INTERVAL_MS = 1200;
 
 const localState = {
   roomId: null,
@@ -70,7 +89,7 @@ const localState = {
   localStream: null,
   screenStream: null,
   unsubscribers: [],
-  peerMeta: new Map(), // peerId -> { name, createdAtMs, lastSeenMs, online }
+  peerMeta: new Map(),
   _videoDetectInterval: null,
   _presenceHeartbeatInterval: null,
   _joined: false,
@@ -90,7 +109,7 @@ const el = {
   roomIdInput: $('#roomId'),
   createRoomBtn: $('#createRoom'),
   leaveRoomBtn: $('#leaveRoom'),
-  shareUrl: $('#shareUrl'), // may be absent
+  shareUrl: $('#shareUrl'),
   videos: $('#videos'),
   displayNameInput: $('#displayName'),
   toggleMicBtn: $('#toggleMic'),
@@ -118,7 +137,6 @@ function safeCreateElem(tag, attrs = {}) {
   return e;
 }
 
-/* Chat log */
 function appendLogToChat({ name = '', text = '', ts = Date.now(), self = false }) {
   if (!el.chatBox) return;
   const wrap = safeCreateElem('div', { class: 'msg' });
@@ -145,22 +163,12 @@ function hasActiveVideoFromStream(stream) {
    5) Video tile helpers (robust)
    ====================== */
 function removeLocalTileIfExists() {
-  try {
-    const existing = document.querySelector('.vid.local');
-    if (existing) existing.remove();
-  } catch (e) {}
+  try { const existing = document.querySelector('.vid.local'); if (existing) existing.remove(); } catch (e) {}
 }
 
 async function ensureVideoPlays(videoEl) {
   if (!videoEl) return;
-  try {
-    if (typeof videoEl.play === 'function') {
-      await videoEl.play();
-    }
-  } catch (e) {
-    // ignore autoplay policy rejections; user gesture will resume
-    console.debug('video.play() issue', e);
-  }
+  try { if (typeof videoEl.play === 'function') await videoEl.play(); } catch (e) { console.debug('video.play() issue', e); }
 }
 
 function createLocalTile(stream) {
@@ -185,7 +193,7 @@ function createLocalTile(stream) {
 
   const tryPlay = async () => {
     await ensureVideoPlays(videoEl).catch(()=>{});
-    setTimeout(()=> { try { videoEl.play && videoEl.play().catch(()=>{}); } catch(e){} updateParticipantsClass(); }, 120);
+    setTimeout(()=> { try { videoEl.play && videoEl.play().catch(()=>{}); } catch(e){} scheduleLayout(); }, 120);
   };
 
   if (videoEl.readyState >= 2) tryPlay(); else videoEl.addEventListener('loadedmetadata', tryPlay, { once:true });
@@ -220,7 +228,7 @@ function setRemoteStreamOnTile(peerId, stream) {
     tile.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
   }
   localState.remoteStreams.set(peerId, stream);
-  updateParticipantsClass();
+  scheduleLayout();
 }
 
 function removeTile(peerId) {
@@ -228,7 +236,17 @@ function removeTile(peerId) {
   if (t) t.remove();
   localState.peerMeta.delete(peerId);
   localState.remoteStreams.delete(peerId);
-  updateParticipantsClass();
+  scheduleLayout();
+}
+
+/* layout scheduling: throttle with rAF to avoid thrashing */
+let _layoutRaf = null;
+function scheduleLayout() {
+  if (_layoutRaf) cancelAnimationFrame(_layoutRaf);
+  _layoutRaf = requestAnimationFrame(() => {
+    try { updateParticipantsClass(); } catch (e) { console.warn('scheduled layout error', e); }
+    _layoutRaf = null;
+  });
 }
 
 /* Update CSS classes / layout based on participants count */
@@ -249,15 +267,11 @@ function updateParticipantsClass() {
    ====================== */
 async function ensureLocalStream(constraints = { audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } }) {
   try {
-    // If we have a live stream, reuse
     if (localState.localStream) {
       const vtracks = localState.localStream.getVideoTracks();
       if (vtracks && vtracks.length > 0 && vtracks.some(t => t && t.readyState !== 'ended')) return localState.localStream;
-      // else fallthrough to re-acquire
     }
-  } catch (e) {
-    console.warn('localStream check failed', e);
-  }
+  } catch (e) { console.warn('localStream check failed', e); }
 
   const audioWanted = !!(constraints && constraints.audio);
   const baseVideo = (constraints && typeof constraints.video === 'object') ? { ...constraints.video } : {};
@@ -289,11 +303,9 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
   }
 
   let stream = null;
-  // 1) try facingMode exact
   stream = await tryByFacingMode('user', true);
   if (!stream) stream = await tryByFacingMode('user', false);
 
-  // 2) validate stream facingMode setting if available (prefer front)
   try {
     if (stream) {
       const vtracks = stream.getVideoTracks();
@@ -301,15 +313,11 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
         const settings = vtracks[0].getSettings ? vtracks[0].getSettings() : {};
         const facing = settings.facingMode || '';
         if (String(facing).toLowerCase() === 'user') {
-          localState.localStream = stream;
-          createLocalTile(stream);
-          setStatus('Local media active (front camera)');
-          return stream;
+          localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (front camera)'); return stream;
         }
       }
     }
 
-    // 3) enumerate devices and try deviceId if labels are present
     const devices = await listVideoInputs();
     const hasLabels = devices.some(d => d.label && d.label.trim().length > 0);
     if (hasLabels) {
@@ -318,71 +326,40 @@ async function ensureLocalStream(constraints = { audio: true, video: { width: { 
         const byId = await tryByDeviceId(candidate.deviceId);
         if (byId) {
           if (stream) stream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
-          localState.localStream = byId;
-          createLocalTile(byId);
-          setStatus('Local media active (front camera by deviceId)');
-          return byId;
+          localState.localStream = byId; createLocalTile(byId); setStatus('Local media active (front camera by deviceId)'); return byId;
         }
       }
     }
   } catch (e) { console.warn('Explicit front-device attempt failed', e); }
 
-  // 4) fallback: generic getUserMedia
   if (!stream) {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: (Object.keys(baseVideo).length ? baseVideo : true) });
-    } catch (e) {
-      console.error('getUserMedia fallback failed', e);
-      throw e;
-    }
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: audioWanted, video: (Object.keys(baseVideo).length ? baseVideo : true) }); } catch (e) { console.error('getUserMedia fallback failed', e); throw e; }
   }
 
-  // 5) final checks & return best-effort stream
   try {
     const vtracks = stream.getVideoTracks();
     if (!vtracks || vtracks.length === 0) {
-      localState.localStream = stream;
-      createLocalTile(stream);
-      setStatus('Local media active (no video tracks)');
-      return stream;
+      localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (no video tracks)'); return stream;
     }
     const settings = vtracks[0].getSettings ? vtracks[0].getSettings() : {};
     const facing = (settings && settings.facingMode) ? String(settings.facingMode).toLowerCase() : '';
-    if (facing === 'user') {
-      localState.localStream = stream;
-      createLocalTile(stream);
-      setStatus('Local media active (front camera)');
-      return stream;
-    }
+    if (facing === 'user') { localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (front camera)'); return stream; }
 
-    // try explicit deviceId fallback
     try {
       const devices2 = await listVideoInputs(); const labeled2 = devices2.filter(d => d.label && d.label.trim().length > 0);
       if (labeled2.length > 0) {
         const candidate2 = findFrontCandidate(devices2);
         if (candidate2 && candidate2.deviceId) {
           const frontStream = await tryByDeviceId(candidate2.deviceId);
-          if (frontStream) {
-            stream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
-            localState.localStream = frontStream;
-            createLocalTile(frontStream);
-            setStatus('Local media active (front camera final)');
-            return frontStream;
-          }
+          if (frontStream) { stream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} }); localState.localStream = frontStream; createLocalTile(frontStream); setStatus('Local media active (front camera final)'); return frontStream; }
         }
       }
     } catch (e) { console.warn('Final explicit device attempt failed', e); }
 
-    localState.localStream = stream;
-    createLocalTile(stream);
-    setStatus('Local media active (best-effort)');
-    return stream;
+    localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (best-effort)'); return stream;
   } catch (err) {
     console.error('Post-acquire processing failed', err);
-    localState.localStream = stream;
-    createLocalTile(stream);
-    setStatus('Local media active (post-processing error)');
-    return stream;
+    localState.localStream = stream; createLocalTile(stream); setStatus('Local media active (post-processing error)'); return stream;
   }
 }
 
@@ -417,6 +394,7 @@ function signalsCollectionRef(roomId) { return collection(db, 'rooms', roomId, '
 function messagesCollectionRef(roomId) { return collection(db, 'rooms', roomId, 'messages'); }
 
 async function writePeerPresence(roomId, peerId, meta = {}) {
+  if (!FIRESTORE_ENABLED) { console.warn('writePeerPresence skipped — Firestore disabled'); return false; }
   const peerRef = doc(db, 'rooms', roomId, 'peers', peerId);
   const payload = {
     name: meta.name || localState.displayName || 'Guest',
@@ -426,63 +404,42 @@ async function writePeerPresence(roomId, peerId, meta = {}) {
     online: true
   };
   await setDoc(peerRef, payload, { merge: true });
+  return true;
 }
 
 async function touchPeerPresence() {
+  if (!FIRESTORE_ENABLED) return;
   if (!localState.roomId || !localState.peerId) return;
-  try {
-    await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { lastSeen: serverTimestamp ? serverTimestamp() : new Date(), online: true }, { merge: true });
-  } catch (e) {
-    console.warn('touchPeerPresence failed', e);
-  }
+  try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { lastSeen: serverTimestamp ? serverTimestamp() : new Date(), online: true }, { merge: true }); } catch (e) { console.warn('touchPeerPresence failed', e); }
 }
 
 async function removePeerPresence(roomId, peerId) {
-  try {
-    await deleteDoc(doc(db, 'rooms', roomId, 'peers', peerId));
-  } catch (e) {
-    console.warn('removePeerPresence failed', e);
-  }
+  if (!FIRESTORE_ENABLED) return;
+  try { await deleteDoc(doc(db, 'rooms', roomId, 'peers', peerId)); } catch (e) { console.warn('removePeerPresence failed', e); }
 }
 
-/* Consistent signal format: { type: 'offer'|'answer'|'ice', from, to|'all', payload: { type, sdp } | candidate } */
 async function sendSignal(roomId, message) {
-  try {
-    // Normalize payload to be an object if SDP string was provided upstream
-    // (caller should ideally pass object)
-    const msg = { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() };
-    await addDoc(signalsCollectionRef(roomId), msg);
-  } catch (e) {
-    console.error('sendSignal failed', e);
-  }
+  if (!FIRESTORE_ENABLED) { console.warn('sendSignal skipped — Firestore disabled'); return; }
+  try { const msg = { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() }; await addDoc(signalsCollectionRef(roomId), msg); } catch (e) { console.error('sendSignal failed', e); }
 }
 
 async function sendChatMessage(roomId, name, text) {
+  if (!FIRESTORE_ENABLED) { console.warn('sendChatMessage skipped — Firestore disabled'); appendLogToChat({ name, text, ts: Date.now(), self: true }); return; }
   if (!text || !text.trim()) return;
-  try {
-    await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null });
-  } catch (e) {
-    console.error('sendChatMessage failed', e);
-  }
+  try { await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null }); } catch (e) { console.error('sendChatMessage failed', e); }
 }
 
 /* ======================
-   8) WebRTC helpers: replace track, create pc, datachannel, signaling
+   8) WebRTC helpers
    ====================== */
 function replaceOrAddTrack(pc, track, stream) {
   try {
     const kind = track.kind;
     const senders = pc.getSenders ? pc.getSenders() : [];
     const sender = senders.find(s => s.track && s.track.kind === kind);
-    if (sender && typeof sender.replaceTrack === 'function') {
-      sender.replaceTrack(track);
-      return sender;
-    } else {
-      return pc.addTrack(track, stream);
-    }
-  } catch (e) {
-    try { return pc.addTrack(track, stream); } catch (er) { console.warn('replaceOrAddTrack failed', er); }
-  }
+    if (sender && typeof sender.replaceTrack === 'function') { sender.replaceTrack(track); return sender; }
+    else { return pc.addTrack(track, stream); }
+  } catch (e) { try { return pc.addTrack(track, stream); } catch (er) { console.warn('replaceOrAddTrack failed', er); } }
 }
 
 function setupDataChannelHandlers(peerId, dc) {
@@ -500,111 +457,74 @@ function setupDataChannelHandlers(peerId, dc) {
   };
 }
 
-/* Ensure all existing pc's send current local tracks (useful after re-acquiring camera) */
 async function updateLocalTracksOnAllPCs() {
   for (const [peerId, pc] of localState.pcMap.entries()) {
-    try {
-      // Remove tracks that are ended? (We rely on replaceOrAddTrack semantics)
-      if (localState.localStream) localState.localStream.getTracks().forEach(track => replaceOrAddTrack(pc, track, localState.localStream));
+    try { if (localState.localStream) localState.localStream.getTracks().forEach(track => replaceOrAddTrack(pc, track, localState.localStream));
       if (localState.screenStream) localState.screenStream.getTracks().forEach(track => replaceOrAddTrack(pc, track, localState.screenStream));
-    } catch (e) {
-      console.warn('updateLocalTracksOnAllPCs issue', e);
-    }
+    } catch (e) { console.warn('updateLocalTracksOnAllPCs issue', e); }
   }
 }
 
-/* Create RTCPeerConnection for peer (idempotent) */
 function makeNewPeerConnection(peerId, isOfferer = false) {
   if (localState.pcMap.has(peerId)) return localState.pcMap.get(peerId);
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-  // Prepare remote stream container
   const remoteStream = new MediaStream();
   localState.remoteStreams.set(peerId, remoteStream);
 
-  // Add local tracks (replace if possible)
   try {
     if (localState.localStream) localState.localStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.localStream); } catch (e) {} });
     if (localState.screenStream) localState.screenStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.screenStream); } catch (e) {} });
   } catch (e) { console.warn('add local tracks to pc failed', e); }
 
   pc.addEventListener('track', (evt) => {
-    if (evt.streams && evt.streams[0]) {
-      localState.remoteStreams.set(peerId, evt.streams[0]);
-      setRemoteStreamOnTile(peerId, evt.streams[0]);
-    } else {
-      const s = localState.remoteStreams.get(peerId) || new MediaStream();
-      s.addTrack(evt.track);
-      localState.remoteStreams.set(peerId, s);
-      setRemoteStreamOnTile(peerId, s);
-    }
+    if (evt.streams && evt.streams[0]) { localState.remoteStreams.set(peerId, evt.streams[0]); setRemoteStreamOnTile(peerId, evt.streams[0]); }
+    else { const s = localState.remoteStreams.get(peerId) || new MediaStream(); s.addTrack(evt.track); localState.remoteStreams.set(peerId, s); setRemoteStreamOnTile(peerId, s); }
   });
 
-  pc.addEventListener('datachannel', (evt) => {
-    setupDataChannelHandlers(peerId, evt.channel);
-    localState.dcMap.set(peerId, evt.channel);
-  });
+  pc.addEventListener('datachannel', (evt) => { setupDataChannelHandlers(peerId, evt.channel); localState.dcMap.set(peerId, evt.channel); });
 
   pc.addEventListener('icecandidate', async (evt) => {
     if (!evt.candidate) return;
-    try {
-      await sendSignal(localState.roomId, { type: 'ice', from: localState.peerId, to: peerId, payload: { candidate: evt.candidate.toJSON() } });
-    } catch (e) { console.warn('send ice candidate failed', e); }
+    try { await sendSignal(localState.roomId, { type: 'ice', from: localState.peerId, to: peerId, payload: { candidate: evt.candidate.toJSON() } }); } catch (e) { console.warn('send ice candidate failed', e); }
   });
 
-  pc.addEventListener('connectionstatechange', () => {
-    console.log('pc state', peerId, pc.connectionState);
-  });
+  pc.addEventListener('connectionstatechange', () => console.log('pc state', peerId, pc.connectionState));
 
   localState.pcMap.set(peerId, pc);
 
   if (isOfferer) {
-    try {
-      const dc = pc.createDataChannel('p2p-chat');
-      setupDataChannelHandlers(peerId, dc);
-      localState.dcMap.set(peerId, dc);
-    } catch (e) {
-      console.warn('createDataChannel error', e);
-    }
+    try { const dc = pc.createDataChannel('p2p-chat'); setupDataChannelHandlers(peerId, dc); localState.dcMap.set(peerId, dc); } catch (e) { console.warn('createDataChannel error', e); }
   }
 
   return pc;
 }
 
-/* Create and send offer */
 async function createAndSendOffer(roomId, toPeerId) {
+  if (!FIRESTORE_ENABLED) { console.warn('createAndSendOffer skipped — Firestore disabled'); return; }
   setStatus(`Creating offer for ${toPeerId}...`);
   const pc = makeNewPeerConnection(toPeerId, true);
   try {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    // send object payload consistently
     await sendSignal(roomId, { type: 'offer', from: localState.peerId, to: toPeerId, payload: { type: offer.type, sdp: offer.sdp } });
     setStatus(`Offer sent to ${toPeerId}`);
-  } catch (e) {
-    console.error('createAndSendOffer failed', e);
-    setStatus('Offer failed');
-  }
+  } catch (e) { console.error('createAndSendOffer failed', e); setStatus('Offer failed'); }
 }
 
-/* Handle incoming offer => create answer */
 async function handleIncomingOffer(roomId, { from, payload }) {
   setStatus(`Received offer from ${from}`);
   const pc = makeNewPeerConnection(from, false);
   try {
-    // normalize payload to RTCSessionDescriptionInit-like object
     const desc = (typeof payload === 'string' || payload.sdp) ? { type: (payload.type || 'offer'), sdp: (payload.sdp || payload) } : payload;
     await pc.setRemoteDescription(desc);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await sendSignal(roomId, { type: 'answer', from: localState.peerId, to: from, payload: { type: answer.type, sdp: answer.sdp } });
     setStatus(`Answer sent to ${from}`);
-  } catch (e) {
-    console.error('handleIncomingOffer failed', e);
-  }
+  } catch (e) { console.error('handleIncomingOffer failed', e); }
 }
 
-/* Handle incoming answer */
 async function handleIncomingAnswer({ from, payload }) {
   const pc = localState.pcMap.get(from);
   if (!pc) return console.warn('No PC for answer', from);
@@ -612,29 +532,30 @@ async function handleIncomingAnswer({ from, payload }) {
     const desc = (typeof payload === 'string' || payload.sdp) ? { type: (payload.type || 'answer'), sdp: (payload.sdp || payload) } : payload;
     await pc.setRemoteDescription(desc);
     setStatus(`Received answer from ${from}`);
-  } catch (e) {
-    console.error('handleIncomingAnswer failed', e);
-  }
+  } catch (e) { console.error('handleIncomingAnswer failed', e); }
 }
 
-/* Handle incoming ICE */
 async function handleIncomingIce({ from, payload }) {
   const pc = localState.pcMap.get(from);
   if (!pc) return console.warn('No PC for ice', from);
   try {
-    // payload expected { candidate: {...} } or the raw candidate object
     const c = payload && payload.candidate ? payload.candidate : payload;
     if (!c) return;
     await pc.addIceCandidate(new RTCIceCandidate(c));
-  } catch (e) {
-    console.warn('addIceCandidate failed', e);
-  }
+  } catch (e) { console.warn('addIceCandidate failed', e); }
 }
 
 /* ======================
-   9) Firestore listeners (signals / peers / messages)
+   9) Firestore listeners (signals / peers / messages) with guarded fallbacks
    ====================== */
 function startListeningToSignals(roomId) {
+  if (!FIRESTORE_ENABLED) {
+    console.warn('startListeningToSignals skipped — Firestore disabled');
+    // return no-op unsub
+    const noop = () => {};
+    localState.unsubscribers.push(noop);
+    return noop;
+  }
   const q = query(signalsCollectionRef(roomId), orderBy('ts'));
   const unsub = onSnapshot(q, (snapshot) => {
     snapshot.docChanges().forEach(async change => {
@@ -642,16 +563,13 @@ function startListeningToSignals(roomId) {
       const docData = change.doc.data();
       const { type, from, to, payload } = docData;
       if (!type || !from) return;
-      if (from === localState.peerId) return; // ignore our own signals
-      if (to && to !== localState.peerId && to !== 'all') return; // not addressed to us
-
+      if (from === localState.peerId) return;
+      if (to && to !== localState.peerId && to !== 'all') return;
       try {
         if (type === 'offer') await handleIncomingOffer(roomId, { from, payload });
         else if (type === 'answer') await handleIncomingAnswer({ from, payload });
         else if (type === 'ice') await handleIncomingIce({ from, payload });
-      } catch (e) {
-        console.error('Processing signal failed', e);
-      }
+      } catch (e) { console.error('Processing signal failed', e); }
     });
   }, err => console.error('Signals listener error', err));
   localState.unsubscribers.push(unsub);
@@ -659,6 +577,12 @@ function startListeningToSignals(roomId) {
 }
 
 function startListeningToPeers(roomId) {
+  if (!FIRESTORE_ENABLED) {
+    console.warn('startListeningToPeers skipped — Firestore disabled');
+    const noop = () => {};
+    localState.unsubscribers.push(noop);
+    return noop;
+  }
   const q = query(peersCollectionRef(roomId));
   const unsub = onSnapshot(q, (snapshot) => {
     const nowMs = Date.now();
@@ -689,7 +613,6 @@ function startListeningToPeers(roomId) {
       }
     });
 
-    // remove stale peers locally (safety net)
     for (const [pid, meta] of Array.from(localState.peerMeta.entries())) {
       if (pid === localState.peerId) continue;
       const lastSeen = meta.lastSeenMs || meta.lastSeen || 0;
@@ -706,6 +629,12 @@ function startListeningToPeers(roomId) {
 }
 
 function startListeningToMessages(roomId) {
+  if (!FIRESTORE_ENABLED) {
+    console.warn('startListeningToMessages skipped — Firestore disabled');
+    const noop = () => {};
+    localState.unsubscribers.push(noop);
+    return noop;
+  }
   const q = query(messagesCollectionRef(roomId), orderBy('ts'));
   const unsub = onSnapshot(q, (snapshot) => {
     snapshot.docChanges().forEach(change => {
@@ -723,8 +652,8 @@ function startListeningToMessages(roomId) {
    ====================== */
 async function cleanupRoomIfEmpty(roomId) {
   if (!roomId) return;
+  if (!FIRESTORE_ENABLED) { console.warn('cleanupRoomIfEmpty skipped — Firestore disabled'); return; }
   try {
-    // small delay to let presence settle
     await new Promise(res => setTimeout(res, 200));
     const peersSnap = await getDocs(peersCollectionRef(roomId));
     if (!peersSnap || peersSnap.empty) {
@@ -736,18 +665,15 @@ async function cleanupRoomIfEmpty(roomId) {
       deletions.push(deleteDoc(roomDocRef(roomId)).catch(()=>{}));
       await Promise.all(deletions);
       console.log('Room cleanup complete', roomId);
-    } else {
-      console.log('Room not empty — skip cleanup:', roomId, peersSnap.size);
-    }
-  } catch (e) {
-    console.warn('cleanupRoomIfEmpty failed', e);
-  }
+    } else { console.log('Room not empty — skip cleanup:', roomId, peersSnap.size); }
+  } catch (e) { console.warn('cleanupRoomIfEmpty failed', e); }
 }
 
 /* ======================
    11) Join / Leave flows + auto-nickname
    ====================== */
 async function pickAutoDisplayName(roomId) {
+  if (!FIRESTORE_ENABLED) return `Participant${Math.floor(Math.random() * 1000)}`;
   try {
     const snap = await getDocs(peersCollectionRef(roomId));
     let active = 0;
@@ -756,10 +682,7 @@ async function pickAutoDisplayName(roomId) {
       if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) active++;
     });
     return `Participant ${active + 1}`;
-  } catch (e) {
-    console.warn('pickAutoDisplayName failed', e);
-    return `Participant${Math.floor(Math.random() * 1000)}`;
-  }
+  } catch (e) { console.warn('pickAutoDisplayName failed', e); return `Participant${Math.floor(Math.random() * 1000)}`; }
 }
 
 async function joinRoom(roomIdInput) {
@@ -772,52 +695,43 @@ async function joinRoom(roomIdInput) {
   const dn = el.displayNameInput && el.displayNameInput.value;
   if (dn && dn.trim()) localState.displayName = dn.trim();
   else {
-    try {
-      const auto = await pickAutoDisplayName(roomId);
-      localState.displayName = auto;
-      if (el.displayNameInput) el.displayNameInput.value = auto;
-    } catch (e) { console.warn(e); }
+    try { const auto = await pickAutoDisplayName(roomId); localState.displayName = auto; if (el.displayNameInput) el.displayNameInput.value = auto; } catch (e) { console.warn(e); }
   }
 
   setStatus(`Joining ${roomId} as ${localState.peerId} (${localState.displayName})`);
 
-  // update share URL display if element exists
   try { const href = new URL(window.location.href); href.hash = roomId; if (el.shareUrl) { el.shareUrl.textContent = href.toString(); el.shareUrl.classList.remove('visually-hidden'); } } catch(e){ if (el.shareUrl) { el.shareUrl.textContent = `${window.location.href}#${roomId}`; el.shareUrl.classList.remove('visually-hidden'); } }
 
-  // best-effort get local media (do not block join entirely if user denies)
   try { await ensureLocalStream(); } catch (e) { console.warn('No local media available. Continue joining without camera.'); setStatus('Joined (no local media)'); }
 
-  // write presence doc
+  // write presence doc (guarded)
   try {
-    await writePeerPresence(roomId, localState.peerId, { name: localState.displayName });
-  } catch (e) {
-    console.error('Failed to write presence', e);
-    setStatus('Failed to join (Firestore error)');
-    return;
-  }
+    if (FIRESTORE_ENABLED) await writePeerPresence(roomId, localState.peerId, { name: localState.displayName });
+    else setStatus('Firestore disabled — cannot publish presence (local only mode)');
+  } catch (e) { console.error('Failed to write presence', e); setStatus('Failed to join (Firestore error)'); return; }
 
-  // start listeners
+  // start listeners (guarded inside)
   startListeningToPeers(roomId);
   startListeningToSignals(roomId);
   startListeningToMessages(roomId);
 
-  // pre-offer existing peers in room snapshot
-  try {
-    const peersSnap = await getDocs(peersCollectionRef(roomId));
-    peersSnap.forEach(docSnap => {
-      const data = docSnap.data(); const pid = data.peerId || docSnap.id;
-      if (pid === localState.peerId) return;
-      const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
-      if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) {
-        if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e => console.error(e));
-      }
-    });
-  } catch (e) { console.warn('Pre-offer check failed', e); }
+  // pre-offer existing peers using snapshot if Firestore enabled
+  if (FIRESTORE_ENABLED) {
+    try {
+      const peersSnap = await getDocs(peersCollectionRef(roomId));
+      peersSnap.forEach(docSnap => {
+        const data = docSnap.data(); const pid = data.peerId || docSnap.id;
+        if (pid === localState.peerId) return;
+        const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
+        if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) { if (!localState.pcMap.has(pid)) createAndSendOffer(roomId, pid).catch(e => console.error(e)); }
+      });
+    } catch (e) { console.warn('Pre-offer check failed', e); }
+  }
 
   localState._joined = true;
   if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = false;
   if (el.createRoomBtn) el.createRoomBtn.disabled = true;
-  setStatus(`Joined ${roomId}`);
+  setStatus(`Joined ${roomId}${FIRESTORE_ENABLED ? '' : ' (local-only)'}`);
 
   startPresenceHeartbeat();
   startVideoStatePolling();
@@ -832,16 +746,15 @@ async function leaveRoom() {
   if (!localState._joined) { setStatus('Not in a room'); return; }
   const roomId = localState.roomId; setStatus('Leaving room...');
 
-  // close pc's
   for (const [peerId, pc] of localState.pcMap.entries()) { try { pc.close(); } catch (e) {} }
   localState.pcMap.clear(); localState.dcMap.clear();
 
   stopPresenceHeartbeat(); stopVideoStatePolling();
 
   if (roomId && localState.peerId) {
-    try { await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true }); } catch (e) { console.warn('mark offline failed', e); }
-    try { await removePeerPresence(roomId, localState.peerId); } catch (e) { console.warn('remove presence failed', e); }
-    try { await cleanupRoomIfEmpty(roomId); } catch (e) { console.warn('cleanup attempt failed', e); }
+    try { if (FIRESTORE_ENABLED) await setDoc(doc(db, 'rooms', roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true }); } catch (e) { console.warn('mark offline failed', e); }
+    try { if (FIRESTORE_ENABLED) await removePeerPresence(roomId, localState.peerId); } catch (e) { console.warn('remove presence failed', e); }
+    try { if (FIRESTORE_ENABLED) await cleanupRoomIfEmpty(roomId); } catch (e) { console.warn('cleanup attempt failed', e); }
   }
 
   localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e) {} }); localState.unsubscribers = [];
@@ -858,17 +771,17 @@ async function leaveRoom() {
     try { el.roomControlsSection.style.display = ''; localState._autoJoinedFromHash = false; const btn = $('#showControlsBtn'); if (btn) btn.style.display = 'none'; } catch(e){}
   }
 
-  updateParticipantsClass();
+  scheduleLayout();
 }
 
-/* Best-effort cleanup on unload (async may not complete) */
+/* Best-effort cleanup on unload */
 async function tryCleanupOnUnload() {
   stopVideoStatePolling(); stopPresenceHeartbeat();
   try {
     if (localState.roomId && localState.peerId) {
-      try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true }); } catch (e) { console.warn('presence set failed on unload', e); }
-      try { await removePeerPresence(localState.roomId, localState.peerId); } catch (e) { console.warn('removePeerPresence failed on unload', e); }
-      try { await cleanupRoomIfEmpty(localState.roomId); } catch (e) { console.warn('cleanup on unload failed', e); }
+      try { if (FIRESTORE_ENABLED) await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { online: false, lastSeen: serverTimestamp ? serverTimestamp() : new Date() }, { merge: true }); } catch (e) { console.warn('presence set failed on unload', e); }
+      try { if (FIRESTORE_ENABLED) await removePeerPresence(localState.roomId, localState.peerId); } catch (e) { console.warn('removePeerPresence failed on unload', e); }
+      try { if (FIRESTORE_ENABLED) await cleanupRoomIfEmpty(localState.roomId); } catch (e) { console.warn('cleanup on unload failed', e); }
     }
   } catch (err) { console.warn('tryCleanupOnUnload error', err); }
   if (localState.localStream) localState.localStream.getTracks().forEach(t => t.stop());
@@ -883,14 +796,11 @@ window.addEventListener('pagehide', (ev) => { if (!ev.persisted) tryCleanupOnUnl
    ====================== */
 function startPresenceHeartbeat() {
   if (localState._presenceHeartbeatInterval) return;
-  touchPeerPresence().catch(()=>{});
-  localState._presenceHeartbeatInterval = setInterval(() => { touchPeerPresence().catch(()=>{}); }, PRESENCE_HEARTBEAT_MS);
+  if (FIRESTORE_ENABLED) touchPeerPresence().catch(()=>{});
+  localState._presenceHeartbeatInterval = setInterval(() => { if (FIRESTORE_ENABLED) touchPeerPresence().catch(()=>{}); }, PRESENCE_HEARTBEAT_MS);
 }
 function stopPresenceHeartbeat() {
-  if (localState._presenceHeartbeatInterval) {
-    clearInterval(localState._presenceHeartbeatInterval);
-    localState._presenceHeartbeatInterval = null;
-  }
+  if (localState._presenceHeartbeatInterval) { clearInterval(localState._presenceHeartbeatInterval); localState._presenceHeartbeatInterval = null; }
 }
 
 /* ======================
@@ -907,11 +817,8 @@ async function startScreenShare() {
 
     for (const [peerId, pc] of localState.pcMap.entries()) {
       const senders = pc.getSenders().filter(s => s.track && s.track.kind === 'video');
-      if (senders.length > 0) {
-        try { await senders[0].replaceTrack(screenStream.getVideoTracks()[0]); } catch (e) { try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e){} }
-      } else {
-        try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e){}
-      }
+      if (senders.length > 0) { try { await senders[0].replaceTrack(screenStream.getVideoTracks()[0]); } catch (e) { try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e){} } }
+      else { try { pc.addTrack(screenStream.getVideoTracks()[0], screenStream); } catch(e){} }
     }
 
     screenStream.getVideoTracks()[0].addEventListener('ended', async () => {
@@ -926,10 +833,7 @@ async function startScreenShare() {
     });
 
     setStatus('You are sharing your screen');
-  } catch (e) {
-    console.error('startScreenShare failed', e);
-    setStatus('Failed to share screen');
-  }
+  } catch (e) { console.error('startScreenShare failed', e); setStatus('Failed to share screen'); }
 }
 
 /* ======================
@@ -958,16 +862,14 @@ if (el.shareScreenBtn) el.shareScreenBtn.addEventListener('click', () => startSc
 if (el.displayNameInput) el.displayNameInput.addEventListener('change', async () => {
   const nm = el.displayNameInput.value.trim() || 'Guest';
   localState.displayName = nm;
-  if (localState.roomId && localState.peerId) try { await writePeerPresence(localState.roomId, localState.peerId, { name: nm }); } catch(e){ console.warn(e); }
+  if (localState.roomId && localState.peerId) try { if (FIRESTORE_ENABLED) await writePeerPresence(localState.roomId, localState.peerId, { name: nm }); } catch(e){ console.warn(e); }
 });
 
 /* ======================
    16) Initial preview attempt (non-blocking)
    ====================== */
 (async function tryInitPreview() {
-  try {
-    if (!localState.localStream) { await ensureLocalStream({ audio: true, video: { width: 640, height: 360 } }); setMicEnabled(true); setCamEnabled(true); }
-  } catch (e) { console.debug('Initial preview unavailable', e); }
+  try { if (!localState.localStream) { await ensureLocalStream({ audio: true, video: { width: 640, height: 360 } }); setMicEnabled(true); setCamEnabled(true); } } catch (e) { console.debug('Initial preview unavailable', e); }
 })();
 
 /* ======================
@@ -982,16 +884,14 @@ function fitVideosToViewport() {
   } catch (e) { console.warn('fitVideosToViewport error', e); }
 }
 
-/* ====== REPLACE layoutVideoGrid WITH THIS ====== */
+/* layoutVideoGrid: robust, no undefined variables */
 function layoutVideoGrid() {
   try {
     const videosEl = document.querySelector('.videos');
     if (!videosEl) return;
-
     const tiles = Array.from(videosEl.querySelectorAll('.vid'));
     const N = Math.max(tiles.length, 1);
 
-    // Get available height from CSS var or compute fallback
     let cssMaxH = getComputedStyle(document.documentElement).getPropertyValue('--videos-max-h') || '';
     cssMaxH = cssMaxH.trim().replace('px', '');
     let availableHeight = parseInt(cssMaxH, 10);
@@ -1008,7 +908,6 @@ function layoutVideoGrid() {
       availableHeight = Math.max(160, Math.floor(window.innerHeight - (top + roomH + controlsH + footerH + extras)));
     }
 
-    // container width fallback
     const containerRect = videosEl.getBoundingClientRect();
     let containerWidth = (containerRect && containerRect.width && containerRect.width > 0) ? containerRect.width : (window.innerWidth - (document.querySelector('.sidebar') ? document.querySelector('.sidebar').getBoundingClientRect().width : 0) - 40);
     if (!containerWidth || Number.isNaN(containerWidth) || containerWidth <= 0) containerWidth = Math.max(window.innerWidth * 0.6, 320);
@@ -1018,17 +917,7 @@ function layoutVideoGrid() {
     const minTileH = 100;
 
     const maxCols = Math.min(N, Math.max(1, Math.floor(containerWidth / 160)));
-
-    // Best candidate; initialize with safe values
-    let best = {
-      cols: 1,
-      rows: N,
-      tileWidth: containerWidth,
-      tileHeight: Math.max(minTileH, Math.floor(containerWidth / aspectRatio)),
-      totalHeight: Math.ceil(N) * Math.floor(containerWidth / aspectRatio),
-      fits: false,
-      overflow: Infinity
-    };
+    let best = { cols: 1, rows: N, tileWidth: containerWidth, tileHeight: Math.max(minTileH, Math.floor(containerWidth / aspectRatio)), totalHeight: Math.ceil(N) * Math.floor(containerWidth / aspectRatio), fits: false, overflow: Infinity };
 
     for (let cols = 1; cols <= maxCols; cols++) {
       const tileW = (containerWidth - (cols - 1) * gap) / cols;
@@ -1039,14 +928,10 @@ function layoutVideoGrid() {
       const fits = totalH <= availableHeight;
 
       if (fits) {
-        if (!best.fits || tileH > best.tileHeight) {
-          best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight: totalH, fits, overflow };
-        }
+        if (!best.fits || tileH > best.tileHeight) best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight: totalH, fits, overflow };
       } else {
         if (!best.fits) {
-          if (overflow < best.overflow || (Math.abs(overflow - best.overflow) < 1 && tileH > best.tileHeight)) {
-            best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight: totalH, fits: false, overflow };
-          }
+          if (overflow < best.overflow || (Math.abs(overflow - best.overflow) < 1 && tileH > best.tileHeight)) best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight: totalH, fits: false, overflow };
         }
       }
     }
@@ -1058,19 +943,17 @@ function layoutVideoGrid() {
     videosEl.style.gridTemplateColumns = `repeat(${colsToUse}, 1fr)`;
     videosEl.style.setProperty('--tile-height', `${tileHpx}px`);
     videosEl.style.setProperty('--videos-max-h', `${availableHeight}px`);
-
     tiles.forEach(t => { try { t.style.height = `${tileHpx}px`; } catch (e) {} });
     videosEl.style.overflowY = best.fits ? 'hidden' : 'auto';
 
     const statusEl = document.querySelector('#status');
     if (statusEl) statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${rowsToUse} • ${best.fits ? 'fit' : 'scroll'}`;
-  } catch (e) {
-    // never throw to upper listeners — log only
-    console.warn('layoutVideoGrid error', e);
-  }
+  } catch (e) { console.warn('layoutVideoGrid error', e); }
 }
 
-/* ====== REPLACE applyVisibilityRules WITH THIS ====== */
+/* ======================
+   18) Visibility rules & video polling
+   ====================== */
 function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES) {
   try {
     const videosEl = document.querySelector('.videos'); if (!videosEl) return;
@@ -1104,29 +987,22 @@ function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES) {
     infos.forEach(info => {
       const tile = info.tileEl;
       if (visiblePeers.has(info.peer)) {
-        tile.classList.remove('hidden-by-limit');
-        tile.style.display = '';
-        tile.setAttribute('aria-hidden', 'false');
+        tile.classList.remove('hidden-by-limit'); tile.style.display = ''; tile.setAttribute('aria-hidden', 'false');
       } else {
-        tile.classList.add('hidden-by-limit');
-        tile.style.display = 'none';
-        tile.setAttribute('aria-hidden', 'true');
+        tile.classList.add('hidden-by-limit'); tile.style.display = 'none'; tile.setAttribute('aria-hidden', 'true');
       }
     });
 
     const hiddenCount = total - visiblePeers.size;
     setStatus(`${total} participants • ${hiddenCount} hidden`);
     layoutVideoGrid();
-  } catch (e) {
-    console.warn('applyVisibilityRules error', e);
-  }
+  } catch (e) { console.warn('applyVisibilityRules error', e); }
 }
 
 function detectVideoStateAndApply(maxVisible = MAX_VISIBLE_TILES) {
   try {
     const videosEl = document.querySelector('.videos'); if (!videosEl) return;
-    const tiles = Array.from(videosEl.querySelectorAll('.vid'));
-    let changed = false;
+    const tiles = Array.from(videosEl.querySelectorAll('.vid')); let changed = false;
     for (const t of tiles) {
       const videoEl = t.querySelector('video');
       let hasVideo = false;
@@ -1143,16 +1019,8 @@ function detectVideoStateAndApply(maxVisible = MAX_VISIBLE_TILES) {
   } catch (e) { console.warn('detectVideoStateAndApply error', e); }
 }
 
-function startVideoStatePolling() {
-  if (localState._videoDetectInterval) return;
-  localState._videoDetectInterval = setInterval(()=> detectVideoStateAndApply(MAX_VISIBLE_TILES), VIDEO_POLL_INTERVAL_MS);
-}
-function stopVideoStatePolling() {
-  if (localState._videoDetectInterval) {
-    clearInterval(localState._videoDetectInterval);
-    localState._videoDetectInterval = null;
-  }
-}
+function startVideoStatePolling() { if (localState._videoDetectInterval) return; localState._videoDetectInterval = setInterval(()=> detectVideoStateAndApply(MAX_VISIBLE_TILES), VIDEO_POLL_INTERVAL_MS); }
+function stopVideoStatePolling() { if (localState._videoDetectInterval) { clearInterval(localState._videoDetectInterval); localState._videoDetectInterval = null; } }
 
 /* ======================
    19) Shortcuts & debug
@@ -1183,17 +1051,11 @@ window.addEventListener('load', ()=> setTimeout(()=> tryAutoJoinFromHash(), 300)
    ====================== */
 function genId(pref) { return pref + Math.random().toString(36).slice(2,9); }
 function ensureShowControlsButton() {
-  let b = $('#showControlsBtn');
-  if (b) return b;
-  b = document.createElement('button');
-  b.id = 'showControlsBtn';
-  b.textContent = 'Show room controls';
+  let b = $('#showControlsBtn'); if (b) return b;
+  b = document.createElement('button'); b.id = 'showControlsBtn'; b.textContent = 'Show room controls';
   b.style.position = 'fixed'; b.style.bottom = '12px'; b.style.left = '12px'; b.style.zIndex = '9999';
   b.style.padding = '8px 12px'; b.style.borderRadius = '8px';
-  b.addEventListener('click', () => {
-    if (el.roomControlsSection) el.roomControlsSection.style.display = '';
-    b.style.display = 'none';
-  });
+  b.addEventListener('click', () => { if (el.roomControlsSection) el.roomControlsSection.style.display = ''; b.style.display = 'none'; });
   document.body.appendChild(b);
   return b;
 }
@@ -1210,7 +1072,6 @@ window._pakelmeet = {
   applyVisibilityRules,
   layoutVideoGrid,
   ensureLocalStream,
-  updateLocalTracksOnAllPCs
+  updateLocalTracksOnAllPCs,
+  FIRESTORE_ENABLED: () => FIRESTORE_ENABLED
 };
-
-/* End of file */
