@@ -982,6 +982,7 @@ function fitVideosToViewport() {
   } catch (e) { console.warn('fitVideosToViewport error', e); }
 }
 
+/* ====== REPLACE layoutVideoGrid WITH THIS ====== */
 function layoutVideoGrid() {
   try {
     const videosEl = document.querySelector('.videos');
@@ -990,12 +991,11 @@ function layoutVideoGrid() {
     const tiles = Array.from(videosEl.querySelectorAll('.vid'));
     const N = Math.max(tiles.length, 1);
 
-    // Compute available height (use CSS var --videos-max-h if set, otherwise compute)
+    // Get available height from CSS var or compute fallback
     let cssMaxH = getComputedStyle(document.documentElement).getPropertyValue('--videos-max-h') || '';
-    cssMaxH = cssMaxH.trim().replace('px','');
+    cssMaxH = cssMaxH.trim().replace('px', '');
     let availableHeight = parseInt(cssMaxH, 10);
     if (!availableHeight || Number.isNaN(availableHeight)) {
-      // fallback computation: subtract header/controls/footer heights
       const header = document.querySelector('.site-header');
       const roomControls = document.querySelector('#room-controls');
       const controls = document.querySelector('#video-section .controls') || document.querySelector('.controls');
@@ -1008,19 +1008,18 @@ function layoutVideoGrid() {
       availableHeight = Math.max(160, Math.floor(window.innerHeight - (top + roomH + controlsH + footerH + extras)));
     }
 
-    // container width (fallback if getBoundingClientRect returns 0)
+    // container width fallback
     const containerRect = videosEl.getBoundingClientRect();
-    let containerWidth = containerRect.width && containerRect.width > 0 ? containerRect.width : (window.innerWidth - (document.querySelector('.sidebar') ? document.querySelector('.sidebar').getBoundingClientRect().width : 0) - 40);
+    let containerWidth = (containerRect && containerRect.width && containerRect.width > 0) ? containerRect.width : (window.innerWidth - (document.querySelector('.sidebar') ? document.querySelector('.sidebar').getBoundingClientRect().width : 0) - 40);
     if (!containerWidth || Number.isNaN(containerWidth) || containerWidth <= 0) containerWidth = Math.max(window.innerWidth * 0.6, 320);
 
     const aspectRatio = 16 / 9;
     const gap = parseFloat(getComputedStyle(videosEl).gap || 12) || 12;
     const minTileH = 100;
 
-    // upper bound on columns (don't try ridiculous numbers)
     const maxCols = Math.min(N, Math.max(1, Math.floor(containerWidth / 160)));
 
-    // Best candidate container for tile sizing
+    // Best candidate; initialize with safe values
     let best = {
       cols: 1,
       rows: N,
@@ -1040,44 +1039,86 @@ function layoutVideoGrid() {
       const fits = totalH <= availableHeight;
 
       if (fits) {
-        // prefer fits and larger tile height (bigger tiles better)
         if (!best.fits || tileH > best.tileHeight) {
-          best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight, fits, overflow };
+          best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight: totalH, fits, overflow };
         }
       } else {
-        // if nothing fits, prefer the layout with least overflow or larger tiles
         if (!best.fits) {
           if (overflow < best.overflow || (Math.abs(overflow - best.overflow) < 1 && tileH > best.tileHeight)) {
-            best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight, fits: false, overflow };
+            best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight: totalH, fits: false, overflow };
           }
         }
       }
     }
 
-    // finalize tile height
     const tileHpx = Math.max(minTileH, Math.floor(best.tileHeight || 180));
     const colsToUse = best.cols || 1;
+    const rowsToUse = best.rows || Math.ceil(N / colsToUse);
 
-    // apply layout to container
     videosEl.style.gridTemplateColumns = `repeat(${colsToUse}, 1fr)`;
     videosEl.style.setProperty('--tile-height', `${tileHpx}px`);
     videosEl.style.setProperty('--videos-max-h', `${availableHeight}px`);
 
-    // update each tile height (defensive)
-    tiles.forEach(t => {
-      try { t.style.height = `${tileHpx}px`; } catch(e) {}
-    });
-
+    tiles.forEach(t => { try { t.style.height = `${tileHpx}px`; } catch (e) {} });
     videosEl.style.overflowY = best.fits ? 'hidden' : 'auto';
 
-    // status text (non-fatal)
     const statusEl = document.querySelector('#status');
-    if (statusEl) {
-      statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${best.rows || Math.ceil(N/colsToUse)} • ${best.fits ? 'fit' : 'scroll'}`;
-    }
+    if (statusEl) statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${rowsToUse} • ${best.fits ? 'fit' : 'scroll'}`;
   } catch (e) {
-    // Log diagnostic but avoid throwing to caller
-    try { console.warn('layoutVideoGrid error', e); } catch(err) {}
+    // never throw to upper listeners — log only
+    console.warn('layoutVideoGrid error', e);
+  }
+}
+
+/* ====== REPLACE applyVisibilityRules WITH THIS ====== */
+function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES) {
+  try {
+    const videosEl = document.querySelector('.videos'); if (!videosEl) return;
+    const tiles = Array.from(videosEl.querySelectorAll('.vid')); const total = tiles.length;
+    if (total <= maxVisible) {
+      tiles.forEach(t => { t.classList.remove('hidden-by-limit'); t.style.display = ''; t.setAttribute('aria-hidden', 'false'); });
+      setStatus(`${total} participants`);
+      layoutVideoGrid();
+      return;
+    }
+
+    const infos = tiles.map(t => {
+      const peer = t.dataset.peer || t.id || '';
+      const isLocal = t.classList.contains('local') || peer === localState.peerId;
+      const hasVideo = (t.dataset._hasvideo === 'true');
+      const meta = localState.peerMeta.get(peer) || {};
+      const createdAtMs = meta.createdAtMs || 0;
+      return { tileEl: t, peer, isLocal, hasVideo, createdAtMs };
+    });
+
+    infos.sort((a,b) => {
+      if (a.isLocal && !b.isLocal) return -1;
+      if (!a.isLocal && b.isLocal) return 1;
+      if (a.hasVideo && !b.hasVideo) return -1;
+      if (!a.hasVideo && b.hasVideo) return 1;
+      return (a.createdAtMs || 0) - (b.createdAtMs || 0);
+    });
+
+    const visible = infos.slice(0, maxVisible);
+    const visiblePeers = new Set(visible.map(i => i.peer));
+    infos.forEach(info => {
+      const tile = info.tileEl;
+      if (visiblePeers.has(info.peer)) {
+        tile.classList.remove('hidden-by-limit');
+        tile.style.display = '';
+        tile.setAttribute('aria-hidden', 'false');
+      } else {
+        tile.classList.add('hidden-by-limit');
+        tile.style.display = 'none';
+        tile.setAttribute('aria-hidden', 'true');
+      }
+    });
+
+    const hiddenCount = total - visiblePeers.size;
+    setStatus(`${total} participants • ${hiddenCount} hidden`);
+    layoutVideoGrid();
+  } catch (e) {
+    console.warn('applyVisibilityRules error', e);
   }
 }
 
