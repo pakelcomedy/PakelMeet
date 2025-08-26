@@ -1,13 +1,12 @@
 /* ==========================================================
-   PakelMeet — assets/js/app.js (REWRITTEN, production-ready)
-   - Robust local preview (front-camera heuristics on mobile)
-   - Consistent signaling payloads (object { type, sdp })
-   - Use RTCIceCandidate for addIceCandidate
+   PakelMeet — assets/js/app.js (FIXED & PRODUCTION-READY)
+   - Firestore-safe fallback
+   - Candidate queue per-peer + drain
+   - safeSetRemoteDescription with retries
+   - Create PC if candidate arrives before PC
+   - Ensure video.srcObject + try video.play()
    - Replace tracks instead of duplicating
-   - Best-effort video.play() handling
-   - Proper aria-pressed semantics
-   - Clean room join/leave with presence heartbeat + best-effort cleanup
-   - Defensive checks for missing DOM elements + Firestore fallback
+   - Throttled layout scheduling
    ========================================================== */
 
 /* ======================
@@ -35,7 +34,7 @@ const firebaseConfig = {
   measurementId: "G-CHH9NJEB9J"
 };
 
-let FIRESTORE_ENABLED = true; // optimistic; flipped to false on auth failure / config error
+let FIRESTORE_ENABLED = true; // optimistic; turned false on auth/init failure
 
 let app, db, auth;
 try {
@@ -53,14 +52,12 @@ if (FIRESTORE_ENABLED && auth) {
   signInAnonymously(auth).catch(err => {
     console.warn('Firebase anon sign-in failed', err);
     FIRESTORE_ENABLED = false;
-    setStatus('Warning: Firebase auth failed — running local-only');
+    // setStatus might be used before DOM ready; keep try/catch
+    try { setStatus('Warning: Firebase auth failed — running local-only'); } catch(e){}
   });
   onAuthStateChanged(auth, user => {
     currentUser = user;
     console.log('Auth changed -> anon?', !!user);
-    if (!user) {
-      // Could be failure or not signed in yet. Keep FIRESTORE_ENABLED as-is.
-    }
   });
 } else {
   console.log('Firestore disabled — running in local-only preview mode');
@@ -90,6 +87,7 @@ const localState = {
   screenStream: null,
   unsubscribers: [],
   peerMeta: new Map(),
+  candidateQueue: new Map(), // <-- queue ICE candidates arriving early per peer
   _videoDetectInterval: null,
   _presenceHeartbeatInterval: null,
   _joined: false,
@@ -219,13 +217,16 @@ function addRemoteTile(peerId, name = 'Participant') {
   return container;
 }
 
-function setRemoteStreamOnTile(peerId, stream) {
+async function setRemoteStreamOnTile(peerId, stream) {
   let tile = document.querySelector(`#tile-${peerId}`);
   if (!tile) tile = addRemoteTile(peerId, localState.peerMeta.get(peerId)?.name || 'Participant');
   const videoEl = tile.querySelector('video');
   if (videoEl) {
     try { videoEl.srcObject = stream; } catch (e) { console.warn('setRemoteStreamOnTile srcObject fail', e); }
     tile.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
+    // try to play; browsers may block without user gesture but still attempt
+    try { await ensureVideoPlays(videoEl).catch(()=>{}); } catch(e){}
+    videoEl.addEventListener('loadedmetadata', ()=> ensureVideoPlays(videoEl).catch(()=>{}), { once:true });
   }
   localState.remoteStreams.set(peerId, stream);
   scheduleLayout();
@@ -432,6 +433,53 @@ async function sendChatMessage(roomId, name, text) {
 /* ======================
    8) WebRTC helpers
    ====================== */
+
+/* safe setRemoteDescription: retry on InvalidStateError (race) */
+async function safeSetRemoteDescription(pc, desc, tries = 6, waitMs = 120) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      await pc.setRemoteDescription(desc);
+      return;
+    } catch (err) {
+      // If wrong state (race), wait and retry a few times
+      if (err && (err.name === 'InvalidStateError' || String(err).includes('Called in wrong state'))) {
+        await new Promise(r => setTimeout(r, waitMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  // final attempt (let it throw if fails)
+  await pc.setRemoteDescription(desc);
+}
+
+/* helper: enqueue candidate if cannot apply now */
+function enqueueCandidateForPeer(peerId, candPayload) {
+  if (!localState.candidateQueue.has(peerId)) localState.candidateQueue.set(peerId, []);
+  localState.candidateQueue.get(peerId).push(candPayload);
+}
+
+/* drain queued candidates when pc exists and remote description is set */
+async function drainCandidateQueue(peerId) {
+  try {
+    const queue = localState.candidateQueue.get(peerId) || [];
+    if (!queue.length) return;
+    const pc = localState.pcMap.get(peerId);
+    if (!pc) return;
+    try {
+      const rd = pc.remoteDescription;
+      if (!rd || !rd.type) return;
+    } catch(e) { return; }
+    for (const cand of queue) {
+      try {
+        const cobj = cand && cand.candidate ? cand.candidate : cand;
+        if (cobj) await pc.addIceCandidate(new RTCIceCandidate(cobj));
+      } catch(e){ console.warn('drain addIceCandidate failed', e); }
+    }
+    localState.candidateQueue.set(peerId, []);
+  } catch(e) { console.warn('drainCandidateQueue failed', e); }
+}
+
 function replaceOrAddTrack(pc, track, stream) {
   try {
     const kind = track.kind;
@@ -465,6 +513,7 @@ async function updateLocalTracksOnAllPCs() {
   }
 }
 
+/* Create or return existing RTCPeerConnection, attach handlers that drain queued ICE */
 function makeNewPeerConnection(peerId, isOfferer = false) {
   if (localState.pcMap.has(peerId)) return localState.pcMap.get(peerId);
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
@@ -489,7 +538,22 @@ function makeNewPeerConnection(peerId, isOfferer = false) {
     try { await sendSignal(localState.roomId, { type: 'ice', from: localState.peerId, to: peerId, payload: { candidate: evt.candidate.toJSON() } }); } catch (e) { console.warn('send ice candidate failed', e); }
   });
 
-  pc.addEventListener('connectionstatechange', () => console.log('pc state', peerId, pc.connectionState));
+  pc.addEventListener('connectionstatechange', () => {
+    console.log('pc state', peerId, pc.connectionState);
+    // attempt to play remote tile when connected
+    if (pc.connectionState === 'connected') {
+      const tile = document.querySelector(`#tile-${peerId}`);
+      if (tile) {
+        const v = tile.querySelector('video');
+        if (v) try { v.play().catch(()=>{}); } catch(e){}
+      }
+    }
+  });
+
+  // When signaling state changes, attempt to drain queued ICE (safety net)
+  pc.addEventListener('signalingstatechange', () => {
+    try { if (pc.remoteDescription && pc.remoteDescription.type) { drainCandidateQueue(peerId).catch(()=>{}); } } catch(e){}
+  });
 
   localState.pcMap.set(peerId, pc);
 
@@ -517,7 +581,9 @@ async function handleIncomingOffer(roomId, { from, payload }) {
   const pc = makeNewPeerConnection(from, false);
   try {
     const desc = (typeof payload === 'string' || payload.sdp) ? { type: (payload.type || 'offer'), sdp: (payload.sdp || payload) } : payload;
-    await pc.setRemoteDescription(desc);
+    await safeSetRemoteDescription(pc, desc);
+    // drain queued ICE candidates (if any)
+    await drainCandidateQueue(from);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     await sendSignal(roomId, { type: 'answer', from: localState.peerId, to: from, payload: { type: answer.type, sdp: answer.sdp } });
@@ -527,22 +593,41 @@ async function handleIncomingOffer(roomId, { from, payload }) {
 
 async function handleIncomingAnswer({ from, payload }) {
   const pc = localState.pcMap.get(from);
-  if (!pc) return console.warn('No PC for answer', from);
+  if (!pc) {
+    console.warn('No PC for answer', from);
+    return;
+  }
   try {
     const desc = (typeof payload === 'string' || payload.sdp) ? { type: (payload.type || 'answer'), sdp: (payload.sdp || payload) } : payload;
-    await pc.setRemoteDescription(desc);
+    await safeSetRemoteDescription(pc, desc);
+    await drainCandidateQueue(from);
     setStatus(`Received answer from ${from}`);
   } catch (e) { console.error('handleIncomingAnswer failed', e); }
 }
 
 async function handleIncomingIce({ from, payload }) {
-  const pc = localState.pcMap.get(from);
-  if (!pc) return console.warn('No PC for ice', from);
   try {
-    const c = payload && payload.candidate ? payload.candidate : payload;
-    if (!c) return;
-    await pc.addIceCandidate(new RTCIceCandidate(c));
-  } catch (e) { console.warn('addIceCandidate failed', e); }
+    const candidateObj = payload && payload.candidate ? payload.candidate : payload;
+    if (!candidateObj) return;
+    let pc = localState.pcMap.get(from);
+    if (!pc) {
+      // create PC pre-emptively so candidate can be queued/drained later
+      pc = makeNewPeerConnection(from, false);
+    }
+    // If remoteDescription is not set yet, queue candidate
+    try {
+      const rd = pc.remoteDescription;
+      if (!rd || !rd.type) {
+        enqueueCandidateForPeer(from, { candidate: candidateObj });
+        return;
+      }
+    } catch(e) {
+      enqueueCandidateForPeer(from, { candidate: candidateObj });
+      return;
+    }
+    // else apply immediately
+    await pc.addIceCandidate(new RTCIceCandidate(candidateObj));
+  } catch (e) { console.warn('addIceCandidate failed (incoming ice)', e); enqueueCandidateForPeer(from, payload); }
 }
 
 /* ======================
@@ -551,7 +636,6 @@ async function handleIncomingIce({ from, payload }) {
 function startListeningToSignals(roomId) {
   if (!FIRESTORE_ENABLED) {
     console.warn('startListeningToSignals skipped — Firestore disabled');
-    // return no-op unsub
     const noop = () => {};
     localState.unsubscribers.push(noop);
     return noop;
