@@ -34,11 +34,6 @@
     .vid video { width:100%; height:100%; object-fit:cover; display:block; }
     .name { position:absolute; left:8px; bottom:8px; background:rgba(0,0,0,0.45); padding:6px 8px; border-radius:6px; font-size:13px; }
     #shareUrl { margin-top:8px; font-size:12px; word-break:break-all; }
-    .card { background: #071020; color: #e6eef8; padding:12px; border-radius:10px; box-shadow: 0 6px 18px rgba(0,0,0,0.35); margin-bottom:12px; }
-    .controls { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
-    .button { padding:8px 12px; border-radius:8px; background:transparent; color:inherit; border:1px solid rgba(255,255,255,0.06); cursor:pointer; }
-    .button.primary { background: linear-gradient(90deg,#7c5cff,#5e7bff); color:#fff; border:none; }
-    .button.danger { background:#ff6b6b; color:#fff; border:none; }
   </style>
 </head>
 <body>
@@ -104,13 +99,6 @@
       <aside class="sidebar" aria-labelledby="sidebar-title" id="sidebar" role="complementary" style="width:340px;min-width:260px;">
         <h2 id="sidebar-title" class="visually-hidden">Sidebar</h2>
 
-        <div class="card profile" aria-labelledby="profile-title">
-          <h3 id="profile-title" class="visually-hidden">Profile</h3>
-          <label for="displayName" class="label">Display Name</label>
-          <input id="displayName" type="text" name="displayName" placeholder="Your name" data-hook="display-name" />
-          <p class="hint">This name will be shown on your video tile.</p>
-        </div>
-
         <div class="card chat" aria-labelledby="chat-title">
           <h3 id="chat-title">Chat</h3>
 
@@ -175,4 +163,3 @@
   <script type="module" src="assets/js/app.js" defer></script>
 </body>
 </html>
-  
