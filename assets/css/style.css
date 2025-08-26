@@ -662,6 +662,135 @@ body { padding-bottom: calc(var(--safe-pad) + 8px); }
 /* End of file - PakelMeet style.css */
 /* This CSS file is intentionally long and explicit to maximize cross-device stability.
    If you want, I can also produce a compact/squashed version for production deployment. */
+/* ===========================
+   Patch: hide Share Screen on mobile,
+   keep shareUrl in DOM but visually hidden,
+   and prevent control bar clipping on small screens
+   =========================== */
+
+/* 1) Keep #shareUrl in DOM but visually hidden (accessible to JS & optionally to SR)
+   - don't use display:none if you want JS to query it or screen readers to read it.
+   - prefer this over display:none when the element must "tetap ada".
+*/
 #shareUrl {
-  display: none !important;
+  /* visually-hidden (explicit) */
+  position: absolute !important;
+  left: -99999px !important;
+  top: auto !important;
+  width: 1px !important;
+  height: 1px !important;
+  overflow: hidden !important;
+  clip: rect(1px, 1px, 1px, 1px) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background: transparent !important;
 }
+
+/* 2) Hide Share Screen button on mobile
+   - Use several selectors in case markup uses id, data-attr or a class.
+   - Keep it fully removed from layout and tab order on small screens.
+*/
+@media (max-width: 768px) {
+  /* defensive selectors: id, data-role, and common class name */
+  #shareScreen,
+  button#shareScreen,
+  .btn-share-screen,
+  [data-role="share-screen"] {
+    display: none !important;
+    visibility: hidden !important;
+    pointer-events: none !important;      /* ensure no accidental taps */
+    opacity: 0 !important;
+  }
+}
+
+/* 3) Make the sticky controls robust so buttons don't get cut off
+   - keep it centered, limited width, respect safe-area-inset,
+     and ensure padding-bottom on body to avoid overlap.
+*/
+.controls {
+  box-sizing: border-box;                     /* important for fixed width calculations */
+  left: 12px;
+  right: 12px;
+  margin: 0 auto;
+  max-width: calc(100% - 24px);               /* always keep some gutter on very small screens */
+  width: auto;
+  border-radius: 14px;
+  padding: 10px;
+  transform: translateZ(0);                   /* hardware accel to reduce jank */
+}
+
+/* bottom position should respect safe area and small variations in UI */
+@media (max-width: 720px) {
+  .controls {
+    position: fixed;
+    bottom: calc(env(safe-area-inset-bottom, 12px) + 12px);
+    z-index: var(--z-controls, 9000);
+    box-shadow: 0 30px 60px rgba(0,0,0,0.6);
+    left: 12px;
+    right: 12px;
+    max-width: calc(100% - 24px);
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px;
+    /* if you want smaller height: change line below */
+    height: auto;
+  }
+
+  /* ensure buttons don't overflow container and adapt to small widths */
+  .controls .button {
+    flex: 1 1 auto;
+    min-width: 0;          /* allow shrinking */
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+
+  /* Icon-only style (keeps tappable area while being compact) */
+  .controls .btn-icon {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+  }
+
+  /* Provide extra padding bottom so page content isn't hidden behind the sticky bar */
+  body { padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
+}
+
+/* 4) If shareScreen must be hidden but still accessible to scripts that check layout,
+   you can instead use this "collapsed" style which removes visual appearance but
+   keeps the element in DOM flow (rarely needed; prefer display:none above).
+*/
+@media (max-width: 768px) {
+  .share-screen-collapsed {
+    width: 0 !important;
+    height: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    border: 0 !important;
+    overflow: hidden !important;
+    position: relative !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
+  }
+}
+
+/* 5) Small fix: prevent fixed control bar from causing page horizontal overflow */
+html, body {
+  overflow-x: hidden !important;
+}
+
+/* 6) Extra safety: if controls still get cut on some older Android UAs,
+   make the sticky controls use a safe max-width and ensure shadows don't cause overflow */
+@media (max-width: 520px) {
+  .controls {
+    padding-left: 8px;
+    padding-right: 8px;
+    box-shadow: 0 18px 40px rgba(0,0,0,0.5);
+  }
+  .controls .button { padding-left: 8px; padding-right: 8px; font-size: 14px; }
+}
+
+/* End of patch */
