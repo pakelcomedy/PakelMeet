@@ -794,3 +794,6 @@ html, body {
 }
 
 /* End of patch */
+#shareUrl {
+  display: none !important;
+}
