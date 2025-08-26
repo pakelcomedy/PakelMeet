@@ -984,37 +984,102 @@ function fitVideosToViewport() {
 
 function layoutVideoGrid() {
   try {
-    const videosEl = document.querySelector('.videos'); if (!videosEl) return; const tiles = Array.from(videosEl.querySelectorAll('.vid')); const N = Math.max(tiles.length, 1);
-    const header = document.querySelector('.site-header'); const roomControls = document.querySelector('#room-controls'); const controls = document.querySelector('#video-section .controls') || document.querySelector('.controls'); const footer = document.querySelector('.site-footer'); const headerH = header ? header.getBoundingClientRect().height : 0; const roomH = roomControls ? roomControls.getBoundingClientRect().height : 0; const controlsH = controls ? controls.getBoundingClientRect().height : 0; const footerH = footer ? footer.getBoundingClientRect().height : 0; const extras = 28; const availableHeight = Math.max(160, Math.floor(window.innerHeight - (headerH + roomH + controlsH + footerH + extras)));
-    const containerRect = videosEl.getBoundingClientRect(); const containerWidth = containerRect.width && containerRect.width > 0 ? containerRect.width : (window.innerWidth - (document.querySelector('.sidebar') ? document.querySelector('.sidebar').getBoundingClientRect().width : 0) - 40);
-    const aspectRatio = 16/9; let best = { cols:1, rows:N, tileWidth:containerWidth, tileHeight:Math.floor(containerWidth/aspectRatio), totalHeight: Math.ceil(N)*Math.floor(containerWidth/aspectRatio), fits:false, overflow: Infinity };
-    const gap = parseFloat(getComputedStyle(videosEl).gap || 12); const maxCols = Math.min(N, Math.max(1, Math.floor(containerWidth / 160)));
-    for (let cols=1; cols<=maxCols; cols++) {
-      const tileW = (containerWidth - (cols - 1) * gap) / cols; const tileH = tileW / aspectRatio; const rows = Math.ceil(N / cols); const totalH = rows * tileH + (rows - 1) * gap; const overflow = Math.max(0, totalH - availableHeight); const fits = totalH <= availableHeight;
+    const videosEl = document.querySelector('.videos');
+    if (!videosEl) return;
+
+    const tiles = Array.from(videosEl.querySelectorAll('.vid'));
+    const N = Math.max(tiles.length, 1);
+
+    // Compute available height (use CSS var --videos-max-h if set, otherwise compute)
+    let cssMaxH = getComputedStyle(document.documentElement).getPropertyValue('--videos-max-h') || '';
+    cssMaxH = cssMaxH.trim().replace('px','');
+    let availableHeight = parseInt(cssMaxH, 10);
+    if (!availableHeight || Number.isNaN(availableHeight)) {
+      // fallback computation: subtract header/controls/footer heights
+      const header = document.querySelector('.site-header');
+      const roomControls = document.querySelector('#room-controls');
+      const controls = document.querySelector('#video-section .controls') || document.querySelector('.controls');
+      const footer = document.querySelector('.site-footer');
+      const top = header ? header.getBoundingClientRect().height : 0;
+      const roomH = roomControls ? roomControls.getBoundingClientRect().height : 0;
+      const controlsH = controls ? controls.getBoundingClientRect().height : 0;
+      const footerH = footer ? footer.getBoundingClientRect().height : 0;
+      const extras = 32;
+      availableHeight = Math.max(160, Math.floor(window.innerHeight - (top + roomH + controlsH + footerH + extras)));
+    }
+
+    // container width (fallback if getBoundingClientRect returns 0)
+    const containerRect = videosEl.getBoundingClientRect();
+    let containerWidth = containerRect.width && containerRect.width > 0 ? containerRect.width : (window.innerWidth - (document.querySelector('.sidebar') ? document.querySelector('.sidebar').getBoundingClientRect().width : 0) - 40);
+    if (!containerWidth || Number.isNaN(containerWidth) || containerWidth <= 0) containerWidth = Math.max(window.innerWidth * 0.6, 320);
+
+    const aspectRatio = 16 / 9;
+    const gap = parseFloat(getComputedStyle(videosEl).gap || 12) || 12;
+    const minTileH = 100;
+
+    // upper bound on columns (don't try ridiculous numbers)
+    const maxCols = Math.min(N, Math.max(1, Math.floor(containerWidth / 160)));
+
+    // Best candidate container for tile sizing
+    let best = {
+      cols: 1,
+      rows: N,
+      tileWidth: containerWidth,
+      tileHeight: Math.max(minTileH, Math.floor(containerWidth / aspectRatio)),
+      totalHeight: Math.ceil(N) * Math.floor(containerWidth / aspectRatio),
+      fits: false,
+      overflow: Infinity
+    };
+
+    for (let cols = 1; cols <= maxCols; cols++) {
+      const tileW = (containerWidth - (cols - 1) * gap) / cols;
+      const tileH = tileW / aspectRatio;
+      const rows = Math.ceil(N / cols);
+      const totalH = rows * tileH + (rows - 1) * gap;
+      const overflow = Math.max(0, totalH - availableHeight);
+      const fits = totalH <= availableHeight;
+
       if (fits) {
-        if (!best.fits || tileH > best.tileHeight) best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits, overflow };
+        // prefer fits and larger tile height (bigger tiles better)
+        if (!best.fits || tileH > best.tileHeight) {
+          best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight, fits, overflow };
+        }
       } else {
+        // if nothing fits, prefer the layout with least overflow or larger tiles
         if (!best.fits) {
           if (overflow < best.overflow || (Math.abs(overflow - best.overflow) < 1 && tileH > best.tileHeight)) {
-            best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits:false, overflow };
+            best = { cols, rows, tileWidth: tileW, tileHeight: tileH, totalHeight, fits: false, overflow };
           }
         }
       }
     }
-    const minTileH = 100; const tileHpx = Math.max(minTileH, Math.floor(best.tileHeight)); const colsToUse = best.cols;
+
+    // finalize tile height
+    const tileHpx = Math.max(minTileH, Math.floor(best.tileHeight || 180));
+    const colsToUse = best.cols || 1;
+
+    // apply layout to container
     videosEl.style.gridTemplateColumns = `repeat(${colsToUse}, 1fr)`;
     videosEl.style.setProperty('--tile-height', `${tileHpx}px`);
     videosEl.style.setProperty('--videos-max-h', `${availableHeight}px`);
-    tiles.forEach(t => { t.style.height = `${tileHpx}px`; });
-    videosEl.style.overflowY = best.fits ? 'hidden' : 'auto';
-    const statusEl = document.querySelector('#status');
-    if (statusEl) statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${best.rows} • ${best.fits ? 'fit' : 'scroll'}`;
-  } catch (e) { console.warn('layoutVideoGrid error', e); }
-}
 
-window.addEventListener('load', ()=>{ fitVideosToViewport(); setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
-window.addEventListener('resize', ()=>{ fitVideosToViewport(); layoutVideoGrid(); });
-window.addEventListener('orientationchange', ()=>{ setTimeout(()=>{ fitVideosToViewport(); layoutVideoGrid(); }, 120); });
+    // update each tile height (defensive)
+    tiles.forEach(t => {
+      try { t.style.height = `${tileHpx}px`; } catch(e) {}
+    });
+
+    videosEl.style.overflowY = best.fits ? 'hidden' : 'auto';
+
+    // status text (non-fatal)
+    const statusEl = document.querySelector('#status');
+    if (statusEl) {
+      statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${best.rows || Math.ceil(N/colsToUse)} • ${best.fits ? 'fit' : 'scroll'}`;
+    }
+  } catch (e) {
+    // Log diagnostic but avoid throwing to caller
+    try { console.warn('layoutVideoGrid error', e); } catch(err) {}
+  }
+}
 
 /* ======================
    18) Visibility rules & video detection
