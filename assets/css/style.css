@@ -361,6 +361,77 @@ main#main{
 /* status */
 #status{ padding:10px; border-radius:8px; background: rgba(255,255,255,0.01); color:var(--muted); border:1px dashed rgba(255,255,255,0.02); }
 
+/* =========================
+   MOBILE: limit chat vertical height (only for small screens)
+   Paste this at the END of style.css
+   ========================= */
+@media (max-width: 920px) {
+  /* tweak globals for chat sizing (adjust the numbers if your header/controls are larger) */
+  :root {
+    /* estimated heights (px) used to reserve space: header + top padding, controls, close button etc. */
+    --chat-reserve-top: 120px;   /* header + top gaps */
+    --chat-reserve-bottom: 120px; /* sticky controls + chat form + bottom gaps (safe default) */
+  }
+
+  /* ensure chat card itself cannot exceed available viewport */
+  .sidebar.open .card.chat,
+  .card.chat {
+    display: flex !important;
+    flex-direction: column !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    /* limit the full card height so it never grows beyond usable viewport */
+    max-height: calc(100vh - var(--chat-reserve-top)) !important;
+    box-sizing: border-box !important;
+    overflow: hidden !important; /* keep scroll only inside #chatBox */
+  }
+
+  /* chat log: fill remaining space inside card but never exceed viewport space */
+  #chatBox,
+  .chat-box {
+    flex: 1 1 auto !important;
+    /* make the chat log a bit shorter than the card to leave room for the chat form */
+    max-height: calc(100vh - (var(--chat-reserve-top) + var(--chat-reserve-bottom))) !important;
+    min-height: 120px !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    padding: 12px !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+    -webkit-overflow-scrolling: touch !important;
+  }
+
+  /* keep the chat form fixed-height at bottom of the card */
+  .chat-form {
+    flex: 0 0 auto !important;
+    margin-top: 8px !important;
+    padding-top: 6px !important;
+    border-top: 0 !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    background: transparent !important;
+  }
+
+  /* compact layout for extra-small screens */
+  @media (max-width: 420px) {
+    :root {
+      --chat-reserve-top: 110px;
+      --chat-reserve-bottom: 140px;
+    }
+    #chatBox, .chat-box {
+      max-height: calc(100vh - (var(--chat-reserve-top) + var(--chat-reserve-bottom))) !important;
+    }
+    .chat-form { gap: 8px !important; }
+  }
+}
+
+/* optional: small visual polish so the chat log doesn't look "infinite" on mobile */
+@media (max-width: 920px) {
+  .chat-box { border-radius: 12px; }
+  .chat-box .msg .text { font-size: 15px; line-height: 1.3; }
+}
+
+
 /* ===========================================================
    8) Accessibility & focus
    =========================================================== */
@@ -797,3 +868,4 @@ html, body {
 #shareUrl {
   display: none !important;
 }
+

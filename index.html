@@ -95,20 +95,27 @@
 
       </div> <!-- end left-column -->
 
-      <!-- Sidebar: display name, chat, status -->
-      <aside class="sidebar" aria-labelledby="sidebar-title" id="sidebar" role="complementary" style="width:340px;min-width:260px;">
+      <!-- Sidebar: display name, chat, status
+      <aside class="sidebar" aria-labelledby="sidebar-title" id="sidebar" role="complementary">
         <h2 id="sidebar-title" class="visually-hidden">Sidebar</h2>
+
+        <div class="card profile" aria-labelledby="profile-title">
+          <h3 id="profile-title" class="visually-hidden">Profile</h3>
+          <label for="displayName" class="label">Display Name</label>
+          <input id="displayName" type="text" name="displayName" placeholder="Your name" data-hook="display-name" />
+          <p class="hint">This name will be shown on your video tile.</p>
+        </div> -->
 
         <div class="card chat" aria-labelledby="chat-title">
           <h3 id="chat-title">Chat</h3>
 
           <!-- Chat log -->
-          <div id="chatBox" class="chat-box" role="log" aria-live="polite" aria-atomic="false" style="max-height:260px;overflow:auto;padding:6px;border-radius:8px;background:rgba(255,255,255,0.02)"></div>
+          <div id="chatBox" class="chat-box" role="log" aria-live="polite" aria-atomic="false"></div>
 
-          <!-- Chat form -->
-          <form id="chatForm" class="chat-form" action="#" autocomplete="off" novalidate style="display:flex;gap:8px;margin-top:8px;">
+          <!-- Chat form: use submit for keyboard accessibility; JS should preventDefault and handle sending -->
+          <form id="chatForm" class="chat-form" action="#" autocomplete="off" novalidate>
             <label for="chatInput" class="visually-hidden">Type message</label>
-            <input id="chatInput" type="text" name="message" placeholder="Type a message…" data-hook="chat-input" aria-label="Type a message" style="flex:1;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit"/>
+            <input id="chatInput" type="text" name="message" placeholder="Type a message…" data-hook="chat-input" aria-label="Type a message" />
             <button id="sendChat" type="submit" data-hook="send-chat" class="button primary">Send</button>
           </form>
         </div>
