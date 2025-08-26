@@ -136,6 +136,8 @@ function hasActiveVideoFromStream(stream){
    ====================== */
 function removeLocalTileIfExists(){ try{ const e=document.querySelector('.vid.local'); if(e) e.remove(); }catch(e){} }
 async function ensureVideoPlays(videoEl){ if(!videoEl) return; try{ if(typeof videoEl.play==='function') await videoEl.play(); } catch(e){ console.debug('video.play() blocked', e); } }
+
+/* createLocalTile: now ensures tabindex + auto-attach fullscreen handler (or queue) */
 function createLocalTile(stream){
   removeLocalTileIfExists();
   const tpl = document.querySelector('#video-tile-template');
@@ -143,6 +145,9 @@ function createLocalTile(stream){
   container.dataset.peer = localState.peerId || 'local';
   container.classList.add('vid','local');
   container.id = `tile-${localState.peerId||'local'}`;
+  // allow keyboard focus for ESC handling
+  container.setAttribute('tabindex', '0');
+
   const videoEl = container.querySelector('video') || safeCreateElem('video');
   videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true;
   try{ videoEl.srcObject = stream; } catch(e){ console.warn('set srcObject local failed', e); }
@@ -152,16 +157,36 @@ function createLocalTile(stream){
   if(!container.contains(nameEl)) container.appendChild(nameEl);
   container.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
   if (el.videos) el.videos.prepend(container);
+
+  // try attach fullscreen handlers now, otherwise queue (handled by FS module later)
+  try {
+    if (window._pakelmeet && typeof window._pakelmeet.attachFullscreenHandlers === 'function') {
+      window._pakelmeet.attachFullscreenHandlers(container);
+    } else {
+      window._pakelmeet = window._pakelmeet || {};
+      window._pakelmeet._pendingAttach = window._pakelmeet._pendingAttach || [];
+      window._pakelmeet._pendingAttach.push(container);
+    }
+  } catch(e){
+    // swallow any attach errors; FS module will scan DOM as fallback
+    console.debug('attachFullscreenHandlers not ready yet, queued', e);
+  }
+
   const tryPlay = async ()=>{ await ensureVideoPlays(videoEl).catch(()=>{}); setTimeout(()=> { try { videoEl.play && videoEl.play().catch(()=>{}); } catch(e){} scheduleLayout(); }, 120); };
   if (videoEl.readyState >= 2) tryPlay(); else videoEl.addEventListener('loadedmetadata', tryPlay, { once:true });
   updateParticipantsClass();
   return container;
 }
+
+/* addRemoteTile: now ensures tabindex + auto-attach fullscreen handler (or queue) */
 function addRemoteTile(peerId, name='Participant'){
   if (document.querySelector(`#tile-${peerId}`)) return document.querySelector(`#tile-${peerId}`);
   const tpl = document.querySelector('#video-tile-template');
   const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : safeCreateElem('div', { class:'vid' });
   container.dataset.peer = peerId; container.id = `tile-${peerId}`;
+  // allow keyboard focus
+  container.setAttribute('tabindex', '0');
+
   const videoEl = container.querySelector('video') || safeCreateElem('video');
   videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = false;
   if(!container.contains(videoEl)) container.appendChild(videoEl);
@@ -170,9 +195,24 @@ function addRemoteTile(peerId, name='Participant'){
   if(!container.contains(nameEl)) container.appendChild(nameEl);
   container.dataset._hasvideo = 'false';
   if (el.videos) el.videos.appendChild(container);
+
+  // try attach fullscreen handlers now, otherwise queue
+  try {
+    if (window._pakelmeet && typeof window._pakelmeet.attachFullscreenHandlers === 'function') {
+      window._pakelmeet.attachFullscreenHandlers(container);
+    } else {
+      window._pakelmeet = window._pakelmeet || {};
+      window._pakelmeet._pendingAttach = window._pakelmeet._pendingAttach || [];
+      window._pakelmeet._pendingAttach.push(container);
+    }
+  } catch(e){
+    console.debug('attachFullscreenHandlers not ready yet, queued', e);
+  }
+
   updateParticipantsClass();
   return container;
 }
+
 async function setRemoteStreamOnTile(peerId, stream){
   let tile = document.querySelector(`#tile-${peerId}`);
   if(!tile) tile = addRemoteTile(peerId, localState.peerMeta.get(peerId)?.name || 'Participant');
@@ -788,5 +828,218 @@ function ensureShowControlsButton(){ let b = $('#showControlsBtn'); if (b) retur
 
 /* expose debug */
 window._pakelmeet = { localState, joinRoom, leaveRoom, setStatus, sendChatMessage, applyVisibilityRules, layoutVideoGrid, ensureLocalStream, updateLocalTracksOnAllPCs: async ()=> { for(const [peerId,pc] of localState.pcMap.entries()){ try{ if(localState.localStream) localState.localStream.getTracks().forEach(track=> replaceOrAddTrack(pc, track, localState.localStream)); if(localState.screenStream) localState.screenStream.getTracks().forEach(track=> replaceOrAddTrack(pc, track, localState.screenStream)); } catch(e){ console.warn('updateLocalTracksOnAllPCs', e); } } }, processedSignalIds: localState.processedSignalIds };
+
+/* =========================
+   Fullscreen on double-tap / double-click
+   - Attach handlers to each .vid tile
+   - Use native Fullscreen API if possible, fallback to .vid.fullscreen CSS class
+   ========================= */
+
+(function enableTileDoubleTapFullscreen() {
+  const DOUBLE_TAP_MS = 300;   // max delay between taps
+  const MAX_MOVE_PX = 24;      // max allowed move to still count as a tap
+  const attachedFlag = 'data-fs-attached';
+
+  function isInteractiveTarget(el) {
+    if (!el) return false;
+    const interactiveTags = ['BUTTON', 'A', 'INPUT', 'SELECT', 'TEXTAREA'];
+    if (interactiveTags.includes(el.tagName)) return true;
+    if (el.closest && el.closest('.tile-controls')) return true; // keep clicks on control buttons safe
+    return false;
+  }
+
+  function removeAnyFullscreenTile() {
+    const prev = document.querySelector('.vid.fullscreen');
+    if (prev) {
+      prev.classList.remove('fullscreen');
+      // revert body overflow if we blocked it
+      try { document.body.style.overflow = ''; } catch (e) {}
+    }
+  }
+
+  async function enterNativeFullscreen(el) {
+    try {
+      if (el.requestFullscreen) {
+        await el.requestFullscreen();
+        return true;
+      }
+      // vendor prefixes (older browsers)
+      if (el.webkitRequestFullscreen) { el.webkitRequestFullscreen(); return true; }
+      if (el.mozRequestFullScreen) { el.mozRequestFullScreen(); return true; }
+      if (el.msRequestFullscreen) { el.msRequestFullscreen(); return true; }
+    } catch (e) {
+      console.warn('requestFullscreen failed', e);
+    }
+    return false;
+  }
+
+  async function exitNativeFullscreen() {
+    try {
+      if (document.exitFullscreen) { await document.exitFullscreen(); return true; }
+      if (document.webkitExitFullscreen) { document.webkitExitFullscreen(); return true; }
+      if (document.mozCancelFullScreen) { document.mozCancelFullScreen(); return true; }
+      if (document.msExitFullscreen) { document.msExitFullscreen(); return true; }
+    } catch (e) {
+      console.warn('exitFullscreen failed', e);
+    }
+    return false;
+  }
+
+  async function toggleTileFullscreen(tile) {
+    if (!tile) return;
+    const currentlyNative = !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement);
+    const isFullscreenClass = tile.classList.contains('fullscreen');
+
+    // If already native fullscreen but for a different element, exit first
+    if (currentlyNative) {
+      // If the native fullscreen element is the tile (or inside it), just exit
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement;
+      if (fsEl && tile.contains(fsEl)) {
+        await exitNativeFullscreen();
+        // native fullscreenchange handler will remove/add classes as needed
+        return;
+      }
+      // otherwise exit native and then enter this one
+      await exitNativeFullscreen();
+      removeAnyFullscreenTile();
+    }
+
+    // If this tile is currently using CSS-fullscreen class -> exit
+    if (isFullscreenClass) {
+      tile.classList.remove('fullscreen');
+      try { document.body.style.overflow = ''; } catch(e){}
+      return;
+    }
+
+    // Otherwise: enter fullscreen - first try native, fallback to CSS class
+    removeAnyFullscreenTile();
+
+    const usedNative = await enterNativeFullscreen(tile).catch(()=>false);
+    if (usedNative) {
+      // add class for consistent styling + in case CSS relies on it
+      tile.classList.add('fullscreen');
+      try { document.body.style.overflow = 'hidden'; } catch(e){}
+      return;
+    }
+
+    // fallback: just add class and lock background scroll
+    tile.classList.add('fullscreen');
+    try { document.body.style.overflow = 'hidden'; } catch(e){}
+  }
+
+  // sync classes when native fullscreen changes (e.g., user pressed ESC)
+  function onNativeFullscreenChange() {
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement;
+    // remove existing class from any tile not equal to fsEl
+    document.querySelectorAll('.vid.fullscreen').forEach(t => {
+      if (!fsEl || !t.contains(fsEl)) {
+        t.classList.remove('fullscreen');
+      }
+    });
+    // If fsEl is inside a .vid, ensure that .vid has class
+    if (fsEl) {
+      const tile = fsEl.closest ? fsEl.closest('.vid') : null;
+      if (tile) tile.classList.add('fullscreen');
+    } else {
+      // no native fullscreen -> restore body overflow
+      try { document.body.style.overflow = ''; } catch(e){}
+    }
+  }
+
+  document.addEventListener('fullscreenchange', onNativeFullscreenChange);
+  document.addEventListener('webkitfullscreenchange', onNativeFullscreenChange);
+  document.addEventListener('mozfullscreenchange', onNativeFullscreenChange);
+  document.addEventListener('MSFullscreenChange', onNativeFullscreenChange);
+
+  // attach handlers to a tile element
+  function attachFullscreenHandlers(tile) {
+    if (!tile || tile.getAttribute(attachedFlag) === '1') return;
+    tile.setAttribute(attachedFlag, '1');
+
+    // --- desktop double-click ---
+    tile.addEventListener('dblclick', (ev) => {
+      if (isInteractiveTarget(ev.target)) return;
+      ev.preventDefault && ev.preventDefault();
+      toggleTileFullscreen(tile).catch(console.warn);
+    });
+
+    // --- touch double-tap detection ---
+    let lastTapTime = 0;
+    let lastTouchX = 0;
+    let lastTouchY = 0;
+    let touchMoved = false;
+
+    tile.addEventListener('touchstart', (ev) => {
+      const t = ev.changedTouches && ev.changedTouches[0];
+      if (t) {
+        lastTouchX = t.clientX;
+        lastTouchY = t.clientY;
+        touchMoved = false;
+      }
+    }, { passive: true });
+
+    tile.addEventListener('touchmove', (ev) => {
+      touchMoved = true;
+    }, { passive: true });
+
+    tile.addEventListener('touchend', (ev) => {
+      // ignore if tap landed on interactive control
+      if (isInteractiveTarget(ev.target)) {
+        lastTapTime = 0; // reset so control taps don't count
+        return;
+      }
+
+      const t = ev.changedTouches && ev.changedTouches[0];
+      const now = Date.now();
+      let isDouble = false;
+      if (t && !touchMoved) {
+        const dx = Math.abs(t.clientX - lastTouchX);
+        const dy = Math.abs(t.clientY - lastTouchY);
+        if (dx <= MAX_MOVE_PX && dy <= MAX_MOVE_PX) {
+          if (now - lastTapTime <= DOUBLE_TAP_MS) isDouble = true;
+        }
+      }
+
+      if (isDouble) {
+        // prevent zoom/double-tap native behavior if possible
+        ev.preventDefault && ev.preventDefault();
+        toggleTileFullscreen(tile).catch(console.warn);
+        lastTapTime = 0;
+      } else {
+        lastTapTime = now;
+      }
+    }, { passive: false });
+
+    // keyboard: ESC to exit (if tile has focus)
+    tile.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' || ev.key === 'Esc') {
+        if (tile.classList.contains('fullscreen')) {
+          // prefer to exit native fullscreen if active
+          exitNativeFullscreen().catch(()=>{ tile.classList.remove('fullscreen'); try{ document.body.style.overflow=''; }catch(e){} });
+        }
+      }
+    });
+  }
+
+  // expose helper so createLocalTile/addRemoteTile can call it when creating tiles
+  window._pakelmeet = window._pakelmeet || {};
+  window._pakelmeet.attachFullscreenHandlers = attachFullscreenHandlers;
+
+  // Attach to existing tiles (if any)
+  document.querySelectorAll('.vid').forEach(t => {
+    try { attachFullscreenHandlers(t); } catch(e){}
+  });
+
+  // If any tiles were queued before this module loaded, attach them now
+  try {
+    if (window._pakelmeet && Array.isArray(window._pakelmeet._pendingAttach) && window._pakelmeet._pendingAttach.length) {
+      window._pakelmeet._pendingAttach.forEach(t => {
+        try { attachFullscreenHandlers(t); } catch(e){}
+      });
+      window._pakelmeet._pendingAttach = [];
+    }
+  } catch (e) { /* ignore */ }
+
+})();
 
 /* End of file */
