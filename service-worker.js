@@ -9,7 +9,6 @@ const STATIC_ASSETS = [
   "/icon.png",
   "/assets/css/style.css",
   "/assets/js/app.js",
-  "/assets/favicon.ico",
 ];
 
 // Install service worker dan cache file statis
