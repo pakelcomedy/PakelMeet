@@ -1,7 +1,7 @@
 {
   "name": "Meet",
   "short_name": "Meet",
-  "start_url": "/",
+  "start_url": "index.html",
   "display": "standalone",
   "background_color": "#0f1724",
   "theme_color": "#7c5cff",

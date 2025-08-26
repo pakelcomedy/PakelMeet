@@ -148,7 +148,7 @@ function appendLogToChat({ id=null, name='', text='', ts=Date.now(), self=false 
       if (!metaEl || !textEl) continue;
       const metaText = metaEl.textContent || '';
       const contentText = (textEl.textContent || '').trim();
-      // meta format: "Name · TIME" — we'll compare name substring and text
+      // meta format: "Name · TIME"  we'll compare name substring and text
       if (metaText.indexOf(name) !== -1 && contentText === (text || '')) {
         // try to compare timestamps if element has data-msg-ts
         const existingTs = parseInt(r.getAttribute('data-msg-ts') || '0', 10);
@@ -886,7 +886,7 @@ if (el.chatForm) {
     ev.preventDefault();
     const text = (el.chatInput.value || '').trim();
     if (!text) return;
-    if (!localState.roomId) { setStatus('Not in a room — chat not sent'); return; }
+    if (!localState.roomId) { setStatus('Not in a room  chat not sent'); return; }
 
     try {
       const collRef = messagesCollectionRef(localState.roomId);
