@@ -85,6 +85,7 @@ const localState = {
   peerMeta: new Map(),
   candidateQueue: new Map(),   // peerId => [candidatePayload,...]
   processedSignalIds: new Set(), // to dedupe signals
+  processedMessageIds: new Set(), // to dedupe chat messages (NEW)
   _videoDetectInterval: null,
   _presenceHeartbeatInterval: null,
   _joined: false,
@@ -117,9 +118,10 @@ const el = {
 };
 function setStatus(msg){ if (el.status) el.status.textContent = msg; console.log('[status]', msg); }
 function safeCreateElem(tag, attrs={}){ const e=document.createElement(tag); for(const k in attrs){ if(k==='class') e.className=attrs[k]; else if(k==='text') e.textContent=attrs[k]; else e.setAttribute(k, attrs[k]); } return e; }
-function appendLogToChat({ name='', text='', ts=Date.now(), self=false }) {
+function appendLogToChat({ id = null, name='', text='', ts=Date.now(), self=false }) {
   if (!el.chatBox) return;
   const wrap = safeCreateElem('div', { class:'msg' });
+  if (id) try { wrap.dataset.msgId = id; } catch(e){}
   const meta = safeCreateElem('div', { class:'meta', text:`${name} · ${new Date(ts).toLocaleTimeString()}` });
   const txt = safeCreateElem('div', { class:'text', text });
   if (self) txt.style.fontWeight='600';
@@ -354,7 +356,9 @@ async function writePeerPresence(roomId, peerId, meta={}) {
 async function touchPeerPresence(){ if(!localState.roomId || !localState.peerId) return; try { await setDoc(doc(db, 'rooms', localState.roomId, 'peers', localState.peerId), { lastSeen: serverTimestamp ? serverTimestamp() : new Date(), online:true }, { merge:true }); } catch(e){ console.warn('touchPeerPresence failed', e); } }
 async function removePeerPresence(roomId, peerId){ try { await deleteDoc(doc(db, 'rooms', roomId, 'peers', peerId)); } catch(e){ console.warn('removePeerPresence failed', e); } }
 async function sendSignal(roomId, message){ try { const msg = { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() }; await addDoc(signalsCollectionRef(roomId), msg); } catch(e){ console.error('sendSignal failed', e); } }
-async function sendChatMessage(roomId, name, text){ if(!text || !text.trim()) return; try { await addDoc(messagesCollectionRef(roomId), { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null }); } catch(e){ console.error('sendChatMessage failed', e); } }
+
+// sendChatMessage now returns the created doc id so caller can dedupe the local echo
+async function sendChatMessage(roomId, name, text){ if(!text || !text.trim()) return null; try { const payload = { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null }; const docRef = await addDoc(messagesCollectionRef(roomId), payload); return docRef && docRef.id ? docRef.id : null; } catch(e){ console.error('sendChatMessage failed', e); return null; } }
 
 /* ======================
    WebRTC helpers: negotiation improvements
@@ -626,8 +630,12 @@ function startListeningToMessages(roomId){
   const unsub = onSnapshot(q, (snapshot) => {
     snapshot.docChanges().forEach(change => {
       if (change.type !== 'added') return;
+      const docId = change.doc.id;
+      // skip already processed messages (including local echoes)
+      if (localState.processedMessageIds.has(docId)) return;
       const msg = change.doc.data();
-      appendLogToChat({ name: msg.name || 'Anon', text: msg.text || '', ts: (msg.ts && msg.ts.toMillis) ? msg.ts.toMillis() : (msg.ts || Date.now()), self: msg.from === localState.peerId });
+      appendLogToChat({ id: docId, name: msg.name || 'Anon', text: msg.text || '', ts: (msg.ts && msg.ts.toMillis) ? msg.ts.toMillis() : (msg.ts || Date.now()), self: msg.from === localState.peerId });
+      localState.processedMessageIds.add(docId);
     });
   }, err => console.error('Messages listener error', err));
   localState.unsubscribers.push(unsub);
@@ -670,6 +678,9 @@ async function joinRoom(roomIdInput){
   if (!roomId) { setStatus('Please enter a Room ID before joining'); return; }
   localState.roomId = roomId;
   localState.peerId = genId('p-');
+  // reset processedMessageIds for a fresh session
+  localState.processedMessageIds = new Set();
+
   const dn = el.displayNameInput && el.displayNameInput.value;
   if (dn && dn.trim()) localState.displayName = dn.trim();
   else { try { const auto = await pickAutoDisplayName(roomId); localState.displayName = auto; if (el.displayNameInput) el.displayNameInput.value = auto; } catch(e){} }
@@ -725,6 +736,8 @@ async function leaveRoom(){
   if (localState.localStream) { localState.localStream.getTracks().forEach(t=>t.stop()); localState.localStream = null; }
   if (localState.screenStream) { localState.screenStream.getTracks().forEach(t=>t.stop()); localState.screenStream = null; }
   localState.roomId = null; localState.peerId = null; localState.remoteStreams.clear(); localState.peerMeta.clear(); localState._joined=false;
+  // clear processed message ids so next join is fresh
+  localState.processedMessageIds = new Set();
   if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = true; if (el.createRoomBtn) el.createRoomBtn.disabled = false;
   setStatus('Left room');
   if (localState._autoJoinedFromHash && el.roomControlsSection) {
@@ -783,10 +796,21 @@ async function startScreenShare(){
 if (el.chatForm) {
   el.chatForm.addEventListener('submit', async (ev) => {
     ev.preventDefault();
-    const text = el.chatInput.value || '';
+    const text = (el.chatInput.value || '').trim();
+    if (!text) return;
     if (!localState.roomId) { setStatus('Not in a room  chat not sent'); return; }
-    await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text);
-    appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
+
+    // send and obtain docId for dedup
+    const docId = await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text);
+    if (docId) {
+      appendLogToChat({ id: docId, name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
+      localState.processedMessageIds = localState.processedMessageIds || new Set();
+      localState.processedMessageIds.add(docId);
+    } else {
+      // fallback local echo if write failed
+      appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
+    }
+
     el.chatInput.value = '';
   });
   if (el.sendChatBtn) el.sendChatBtn.addEventListener('click', () => el.chatForm.dispatchEvent(new Event('submit', { cancelable: true })));
@@ -827,7 +851,7 @@ function genId(pref){ return pref + Math.random().toString(36).slice(2,9); }
 function ensureShowControlsButton(){ let b = $('#showControlsBtn'); if (b) return b; b = document.createElement('button'); b.id='showControlsBtn'; b.textContent='Show room controls'; b.style.position='fixed'; b.style.bottom='12px'; b.style.left='12px'; b.style.zIndex='9999'; b.style.padding='8px 12px'; b.style.borderRadius='8px'; b.addEventListener('click', ()=>{ if(el.roomControlsSection) el.roomControlsSection.style.display=''; b.style.display='none'; }); document.body.appendChild(b); return b; }
 
 /* expose debug */
-window._pakelmeet = { localState, joinRoom, leaveRoom, setStatus, sendChatMessage, applyVisibilityRules, layoutVideoGrid, ensureLocalStream, updateLocalTracksOnAllPCs: async ()=> { for(const [peerId,pc] of localState.pcMap.entries()){ try{ if(localState.localStream) localState.localStream.getTracks().forEach(track=> replaceOrAddTrack(pc, track, localState.localStream)); if(localState.screenStream) localState.screenStream.getTracks().forEach(track=> replaceOrAddTrack(pc, track, localState.screenStream)); } catch(e){ console.warn('updateLocalTracksOnAllPCs', e); } } }, processedSignalIds: localState.processedSignalIds };
+window._pakelmeet = { localState, joinRoom, leaveRoom, setStatus, sendChatMessage, applyVisibilityRules, layoutVideoGrid, ensureLocalStream, updateLocalTracksOnAllPCs: async ()=> { for(const [peerId,pc] of localState.pcMap.entries()){ try{ if(localState.localStream) localState.localStream.getTracks().forEach(track=> replaceOrAddTrack(pc, track, localState.localStream)); if(localState.screenStream) localState.screenStream.getTracks().forEach(track=> replaceOrAddTrack(pc, track, localState.screenStream)); } catch(e){ console.warn('updateLocalTracksOnAllPCs', e); } } }, processedSignalIds: localState.processedSignalIds, processedMessageIds: localState.processedMessageIds };
 
 /* =========================
    Fullscreen on double-tap / double-click
