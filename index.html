@@ -3,20 +3,25 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta name="theme-color" content="#0b0f14" />
-  <meta name="description" content="PakelMeet  lightweight P2P video meeting (3-4 users). Frontend-ready for hosting on GitHub Pages. Signaling: Firebase/Firestore." />
+  <meta name="theme-color" content="#7c5cff" />
+  <meta name="application-name" content="Meet" />
+  <meta name="description" content="Meet — lightweight P2P video meeting (3-4 users). Frontend-ready for hosting on GitHub Pages. Signaling: Firebase/Firestore." />
 
-  <title>PakelMeet  P2P Video Meeting</title>
+  <title>Meet — P2P Video Meeting</title>
 
   <!-- Preconnect for Firebase / Google resources -->
   <link rel="preconnect" href="https://www.gstatic.com" crossorigin>
   <link rel="preconnect" href="https://www.googleapis.com" crossorigin>
 
+  <!-- PWA manifest -->
+  <link rel="manifest" href="/manifest.json">
+
+  <!-- Favicons / Apple icon -->
+  <link rel="icon" href="icon.png">
+  <link rel="apple-touch-icon" href="icon.png">
+
   <!-- Main stylesheet -->
   <link rel="stylesheet" href="assets/css/style.css">
-
-  <!-- Favicon -->
-  <link rel="icon" href="assets/favicon.ico" />
 
   <!-- Minimal inline fallback so layout stays readable without CSS -->
   <style>
@@ -29,6 +34,11 @@
     .vid video { width:100%; height:100%; object-fit:cover; display:block; }
     .name { position:absolute; left:8px; bottom:8px; background:rgba(0,0,0,0.45); padding:6px 8px; border-radius:6px; font-size:13px; }
     #shareUrl { margin-top:8px; font-size:12px; word-break:break-all; }
+    .card { background: #071020; color: #e6eef8; padding:12px; border-radius:10px; box-shadow: 0 6px 18px rgba(0,0,0,0.35); margin-bottom:12px; }
+    .controls { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
+    .button { padding:8px 12px; border-radius:8px; background:transparent; color:inherit; border:1px solid rgba(255,255,255,0.06); cursor:pointer; }
+    .button.primary { background: linear-gradient(90deg,#7c5cff,#5e7bff); color:#fff; border:none; }
+    .button.danger { background:#ff6b6b; color:#fff; border:none; }
   </style>
 </head>
 <body>
@@ -40,7 +50,7 @@
     <!-- Header -->
     <header role="banner" class="site-header">
       <div class="brand" aria-hidden="false">
-        <h1 id="app-title">PakelMeet <small aria-hidden="true"> P2P Mesh (3–4 users)</small></h1>
+        <h1 id="app-title">Meet <small aria-hidden="true">P2P Mesh (3–4 users)</small></h1>
       </div>
 
       <div class="meta" aria-hidden="true">
@@ -49,10 +59,10 @@
     </header>
 
     <!-- Main: left column (controls + videos) + right sidebar (profile, chat, status) -->
-    <main id="main" role="main" tabindex="-1">
+    <main id="main" role="main" tabindex="-1" style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;">
 
       <!-- Left column -->
-      <div class="left-column">
+      <div class="left-column" style="flex:1 1 640px;min-width:320px;">
 
         <!-- Room controls -->
         <section aria-labelledby="room-controls-title" class="room-controls card" id="room-controls">
@@ -62,14 +72,13 @@
             <div class="form-field">
               <label for="roomId" class="label">Room ID</label>
               <input id="roomId" name="room" type="text" inputmode="text" placeholder="e.g. team-weekly-sync" aria-describedby="roomHint" required data-hook="room-id" />
-            </div> <!-- closed form-field -->
+            </div>
 
-            <div class="actions" aria-hidden="false">
+            <div class="actions" aria-hidden="false" style="margin-top:8px;display:flex;gap:8px;">
               <button type="button" id="createRoom" data-hook="create-room" class="button primary" aria-pressed="false">Create / Join</button>
               <button type="button" id="leaveRoom" data-hook="leave-room" class="button danger" disabled aria-pressed="false">Leave</button>
             </div>
 
-            <!-- optional share URL display (populated by JS when joined) -->
             <div id="shareUrl" class="share-url visually-hidden" aria-live="polite"></div>
           </form>
         </section>
@@ -78,14 +87,10 @@
         <section aria-labelledby="video-section-title" class="video-section card" id="video-section">
           <h2 id="video-section-title" class="visually-hidden">Video Conference</h2>
 
-          <!-- Videos container
-               JS must toggle: #videos.classList = 'videos participants-N'
-               and append .vid children into this container -->
           <div id="videos" class="videos" role="list" aria-label="Video tiles" tabindex="0">
             <!-- JS will mount <div class="vid"> elements here -->
           </div>
 
-          <!-- Controls (mic/cam/screen) -->
           <div class="controls" role="group" aria-label="Meeting controls">
             <button id="toggleMic" data-hook="toggle-mic" aria-pressed="false" title="Toggle microphone" class="button">🎙️ Mic</button>
             <button id="toggleCam" data-hook="toggle-cam" aria-pressed="false" title="Toggle camera" class="button">🎥 Cam</button>
@@ -95,8 +100,8 @@
 
       </div> <!-- end left-column -->
 
-      <!-- Sidebar: display name, chat, status
-      <aside class="sidebar" aria-labelledby="sidebar-title" id="sidebar" role="complementary">
+      <!-- Sidebar: display name, chat, status -->
+      <aside class="sidebar" aria-labelledby="sidebar-title" id="sidebar" role="complementary" style="width:340px;min-width:260px;">
         <h2 id="sidebar-title" class="visually-hidden">Sidebar</h2>
 
         <div class="card profile" aria-labelledby="profile-title">
@@ -104,18 +109,18 @@
           <label for="displayName" class="label">Display Name</label>
           <input id="displayName" type="text" name="displayName" placeholder="Your name" data-hook="display-name" />
           <p class="hint">This name will be shown on your video tile.</p>
-        </div> -->
+        </div>
 
         <div class="card chat" aria-labelledby="chat-title">
           <h3 id="chat-title">Chat</h3>
 
           <!-- Chat log -->
-          <div id="chatBox" class="chat-box" role="log" aria-live="polite" aria-atomic="false"></div>
+          <div id="chatBox" class="chat-box" role="log" aria-live="polite" aria-atomic="false" style="max-height:260px;overflow:auto;padding:6px;border-radius:8px;background:rgba(255,255,255,0.02)"></div>
 
-          <!-- Chat form: use submit for keyboard accessibility; JS should preventDefault and handle sending -->
-          <form id="chatForm" class="chat-form" action="#" autocomplete="off" novalidate>
+          <!-- Chat form -->
+          <form id="chatForm" class="chat-form" action="#" autocomplete="off" novalidate style="display:flex;gap:8px;margin-top:8px;">
             <label for="chatInput" class="visually-hidden">Type message</label>
-            <input id="chatInput" type="text" name="message" placeholder="Type a message…" data-hook="chat-input" aria-label="Type a message" />
+            <input id="chatInput" type="text" name="message" placeholder="Type a message…" data-hook="chat-input" aria-label="Type a message" style="flex:1;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit"/>
             <button id="sendChat" type="submit" data-hook="send-chat" class="button primary">Send</button>
           </form>
         </div>
@@ -131,8 +136,8 @@
     </main>
 
     <!-- Footer -->
-    <footer role="contentinfo" class="site-footer">
-      <p class="small">PakelMeet  lightweight frontend demo. <strong>Do not</strong> store sensitive data in Firestore without proper security rules.</p>
+    <footer role="contentinfo" class="site-footer" style="margin-top:18px">
+      <p class="small">Meet — lightweight frontend demo. <strong>Do not</strong> store sensitive data in Firestore without proper security rules.</p>
     </footer>
 
     <!-- Templates used by JS to render tiles -->
@@ -149,11 +154,22 @@
     <!-- NoScript -->
     <noscript>
       <div class="noscript card">
-        <p>JavaScript is required to run PakelMeet. Please enable JavaScript and reload the page.</p>
+        <p>JavaScript is required to run Meet. Please enable JavaScript and reload the page.</p>
       </div>
     </noscript>
 
   </div> <!-- end #app -->
+
+  <!-- Register service worker (PWA) -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('/service-worker.js')
+          .then(function (reg) { console.log('Service Worker registered:', reg.scope); })
+          .catch(function (err) { console.warn('Service Worker registration failed:', err); });
+      });
+    }
+  </script>
 
   <!-- App script (module) -->
   <script type="module" src="assets/js/app.js" defer></script>
