@@ -1,5 +1,5 @@
 /* ==========================================================
-  PakelMeet — assets/js/app.js (PRODUCTION READY, Firestore ON)
+  PakelMeet  assets/js/app.js (PRODUCTION READY, Firestore ON)
   Key fixes:
    - Firestore always enabled (no automatic disable)
    - Candidate queue per-peer + drain after remoteDescription
@@ -206,7 +206,7 @@ function updateParticipantsClass(){
    Local media (as before, robust front-camera heuristics)
    ====================== */
 async function ensureLocalStream(constraints = { audio:true, video:{ width:{ ideal:1280 }, height:{ ideal:720 } } }){
-  /* same robust implementation as earlier snapshot — omitted here for brevity but keep integrated */
+  /* same robust implementation as earlier snapshot  omitted here for brevity but keep integrated */
   // For completeness include full implementation:
   try {
     if (localState.localStream) {
@@ -611,7 +611,7 @@ async function cleanupRoomIfEmpty(roomId){
       deletions.push(deleteDoc(roomDocRef(roomId)).catch(()=>{}));
       await Promise.all(deletions);
       console.log('Room cleanup complete', roomId);
-    } else { console.log('Room not empty — skip cleanup:', roomId, peersSnap.size); }
+    } else { console.log('Room not empty  skip cleanup:', roomId, peersSnap.size); }
   } catch(e){ console.warn('cleanupRoomIfEmpty failed', e); }
 }
 
@@ -744,7 +744,7 @@ if (el.chatForm) {
   el.chatForm.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const text = el.chatInput.value || '';
-    if (!localState.roomId) { setStatus('Not in a room — chat not sent'); return; }
+    if (!localState.roomId) { setStatus('Not in a room  chat not sent'); return; }
     await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text);
     appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
     el.chatInput.value = '';
