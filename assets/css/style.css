@@ -662,3 +662,6 @@ body { padding-bottom: calc(var(--safe-pad) + 8px); }
 /* End of file - PakelMeet style.css */
 /* This CSS file is intentionally long and explicit to maximize cross-device stability.
    If you want, I can also produce a compact/squashed version for production deployment. */
+#shareUrl {
+  display: none !important;
+}
