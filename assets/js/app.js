@@ -1,15 +1,7 @@
 /* ==========================================================
-  PakelMeet  assets/js/app.js (PRODUCTION READY, Firestore ON)
-  Key fixes:
-   - Firestore always enabled (no automatic disable)
-   - Candidate queue per-peer + drain after remoteDescription
-   - safeSetRemoteDescription with retries + rollback for glare
-   - Deterministic offerer (polite = localId < remoteId) avoids offer collisions
-   - Create PC when ICE arrives early
-   - Deduplicate incoming signals using doc.id
-   - Ensure video.srcObject + best-effort video.play()
-   - Replace tracks instead of adding duplicates
-  Replace your previous app.js entirely with this file.
+  PakelMeet  assets/js/app.js
+  Fixed: stronger de-dup for chat (Firestore + DataChannel + local), idempotent message listener
+  Replace your current app.js with this file.
   ========================================================== */
 
 /* ======================
@@ -44,12 +36,10 @@ try {
   auth = getAuth(app);
   console.log('Firebase initialized');
 } catch (e) {
-  // keep Firebase errors visible, but DO NOT disable Firestore from code
   console.error('Firebase init error (check config/hosting):', e);
 }
 
-/* Try anonymous sign-in; if it fails due to unauthorized domain, we still keep trying
-   but show instructions to developer in UI. DO NOT silently disable Firestore. */
+/* Try anonymous sign-in */
 signInAnonymously(auth).catch(err => {
   console.warn('Firebase anon sign-in failed (check Authorized domains in Firebase Console):', err);
   try { setStatus('Firebase auth warning: add your domain to Firebase Authorized domains (Console -> Authentication -> Settings).'); } catch(e){}
@@ -63,8 +53,7 @@ onAuthStateChanged(auth, user => {
    ====================== */
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
-  // IMPORTANT: add TURN server(s) here for production to avoid connectivity issues behind NATs
-  // { urls: 'turn:YOUR_TURN_SERVER', username: 'user', credential: 'pass' }
+  // add TURN servers in production
 ];
 
 const PRESENCE_HEARTBEAT_MS = 5000;
@@ -76,21 +65,23 @@ const localState = {
   roomId: null,
   peerId: null,
   displayName: 'Guest',
-  pcMap: new Map(),            // peerId => RTCPeerConnection
-  dcMap: new Map(),            // peerId => DataChannel
-  remoteStreams: new Map(),    // peerId => MediaStream
+  pcMap: new Map(),
+  dcMap: new Map(),
+  remoteStreams: new Map(),
   localStream: null,
   screenStream: null,
   unsubscribers: [],
   peerMeta: new Map(),
-  candidateQueue: new Map(),   // peerId => [candidatePayload,...]
-  processedSignalIds: new Set(), // to dedupe signals
-  processedMessageIds: new Set(), // to dedupe chat messages (NEW)
+  candidateQueue: new Map(),
+  processedSignalIds: new Set(),
+  processedMessageIds: new Set(),
   _videoDetectInterval: null,
   _presenceHeartbeatInterval: null,
   _joined: false,
   _autoJoinedFromHash: false,
   _removeHashAfterAutoJoin: false,
+  _messagesListening: false,
+  _messagesUnsub: null,
 };
 
 /* ======================
@@ -118,28 +109,82 @@ const el = {
 };
 function setStatus(msg){ if (el.status) el.status.textContent = msg; console.log('[status]', msg); }
 function safeCreateElem(tag, attrs={}){ const e=document.createElement(tag); for(const k in attrs){ if(k==='class') e.className=attrs[k]; else if(k==='text') e.textContent=attrs[k]; else e.setAttribute(k, attrs[k]); } return e; }
-function appendLogToChat({ id = null, name='', text='', ts=Date.now(), self=false }) {
+
+/* stable deterministic id generator for messages (simple djb2 hash -> base36)
+   ensures same (from,ts,name,text) produces same id for dedupe when Firestore id absent */
+function stableMsgId(from, name, text, ts){
+  const s = `${from||''}|${String(ts||'') }|${name||''}|${text||''}`;
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) { h = ((h << 5) + h) + s.charCodeAt(i); h = h & 0xffffffff; }
+  return 'm' + (h >>> 0).toString(36);
+}
+
+/* appendLogToChat: prevents DOM duplicates by data-msg-id and near-duplicate content check */
+function appendLogToChat({ id=null, name='', text='', ts=Date.now(), self=false }) {
   if (!el.chatBox) return;
+
+  // normalize ts to number
+  const tsNum = (typeof ts === 'number') ? ts : (ts && ts.toMillis ? ts.toMillis() : Date.now());
+
+  // compute id if not provided (stable)
+  let msgId = id ? String(id) : stableMsgId(null, name, text, tsNum);
+
+  // DOM-level dedupe: if element with same data-msg-id exists, skip
+  try {
+    if (el.chatBox.querySelector(`[data-msg-id="${msgId}"]`)) {
+      console.debug('appendLogToChat: skipping duplicate DOM element for id', msgId);
+      return;
+    }
+  } catch (e) {
+    // selector could throw on weird chars; fallback to content-based check below
+  }
+
+  // content-based near-duplicate guard: check last few messages for same name+text within ~1.2s
+  try {
+    const recent = Array.from(el.chatBox.querySelectorAll('.msg')).slice(-6);
+    for (const r of recent.reverse()) {
+      const metaEl = r.querySelector('.meta');
+      const textEl = r.querySelector('.text');
+      if (!metaEl || !textEl) continue;
+      const metaText = metaEl.textContent || '';
+      const contentText = (textEl.textContent || '').trim();
+      // meta format: "Name · TIME" — we'll compare name substring and text
+      if (metaText.indexOf(name) !== -1 && contentText === (text || '')) {
+        // try to compare timestamps if element has data-msg-ts
+        const existingTs = parseInt(r.getAttribute('data-msg-ts') || '0', 10);
+        if (existingTs && Math.abs(existingTs - tsNum) <= 1200) {
+          console.debug('appendLogToChat: skipping near-duplicate content', name, text, tsNum);
+          return;
+        } else if (!existingTs) {
+          // no ts attr, still skip to be safe
+          console.debug('appendLogToChat: skipping duplicate (no ts) for', name, text);
+          return;
+        }
+      }
+    }
+  } catch (e) { /* ignore */ }
+
   const wrap = safeCreateElem('div', { class:'msg' });
-  if (id) try { wrap.dataset.msgId = id; } catch(e){}
-  const meta = safeCreateElem('div', { class:'meta', text:`${name} · ${new Date(ts).toLocaleTimeString()}` });
+  try { wrap.setAttribute('data-msg-id', msgId); } catch(e){}
+  try { wrap.setAttribute('data-msg-ts', String(tsNum)); } catch(e){}
+  const meta = safeCreateElem('div', { class:'meta', text:`${name} · ${new Date(tsNum).toLocaleTimeString()}` });
   const txt = safeCreateElem('div', { class:'text', text });
   if (self) txt.style.fontWeight='600';
   wrap.appendChild(meta); wrap.appendChild(txt);
   el.chatBox.appendChild(wrap);
   el.chatBox.scrollTop = el.chatBox.scrollHeight;
 }
+
+/* ======================
+   Video helpers (unchanged)
+   ====================== */
 function hasActiveVideoFromStream(stream){
   try { if(!stream) return false; const t = stream.getVideoTracks ? stream.getVideoTracks() : []; return t.some(tt=> tt && tt.enabled !== false && (tt.readyState !== 'ended')); } catch(e){ return false; }
 }
-
-/* ======================
-   Video tiles & playback helpers
-   ====================== */
 function removeLocalTileIfExists(){ try{ const e=document.querySelector('.vid.local'); if(e) e.remove(); }catch(e){} }
 async function ensureVideoPlays(videoEl){ if(!videoEl) return; try{ if(typeof videoEl.play==='function') await videoEl.play(); } catch(e){ console.debug('video.play() blocked', e); } }
 
-/* createLocalTile: now ensures tabindex + auto-attach fullscreen handler (or queue) */
+/* createLocalTile / addRemoteTile / setRemoteStreamOnTile / removeTile same as before but keep stable */
 function createLocalTile(stream){
   removeLocalTileIfExists();
   const tpl = document.querySelector('#video-tile-template');
@@ -147,7 +192,6 @@ function createLocalTile(stream){
   container.dataset.peer = localState.peerId || 'local';
   container.classList.add('vid','local');
   container.id = `tile-${localState.peerId||'local'}`;
-  // allow keyboard focus for ESC handling
   container.setAttribute('tabindex', '0');
 
   const videoEl = container.querySelector('video') || safeCreateElem('video');
@@ -160,7 +204,6 @@ function createLocalTile(stream){
   container.dataset._hasvideo = hasActiveVideoFromStream(stream) ? 'true' : 'false';
   if (el.videos) el.videos.prepend(container);
 
-  // try attach fullscreen handlers now, otherwise queue (handled by FS module later)
   try {
     if (window._pakelmeet && typeof window._pakelmeet.attachFullscreenHandlers === 'function') {
       window._pakelmeet.attachFullscreenHandlers(container);
@@ -170,7 +213,6 @@ function createLocalTile(stream){
       window._pakelmeet._pendingAttach.push(container);
     }
   } catch(e){
-    // swallow any attach errors; FS module will scan DOM as fallback
     console.debug('attachFullscreenHandlers not ready yet, queued', e);
   }
 
@@ -180,13 +222,11 @@ function createLocalTile(stream){
   return container;
 }
 
-/* addRemoteTile: now ensures tabindex + auto-attach fullscreen handler (or queue) */
 function addRemoteTile(peerId, name='Participant'){
   if (document.querySelector(`#tile-${peerId}`)) return document.querySelector(`#tile-${peerId}`);
   const tpl = document.querySelector('#video-tile-template');
   const container = (tpl && tpl.content) ? tpl.content.firstElementChild.cloneNode(true) : safeCreateElem('div', { class:'vid' });
   container.dataset.peer = peerId; container.id = `tile-${peerId}`;
-  // allow keyboard focus
   container.setAttribute('tabindex', '0');
 
   const videoEl = container.querySelector('video') || safeCreateElem('video');
@@ -198,7 +238,6 @@ function addRemoteTile(peerId, name='Participant'){
   container.dataset._hasvideo = 'false';
   if (el.videos) el.videos.appendChild(container);
 
-  // try attach fullscreen handlers now, otherwise queue
   try {
     if (window._pakelmeet && typeof window._pakelmeet.attachFullscreenHandlers === 'function') {
       window._pakelmeet.attachFullscreenHandlers(container);
@@ -245,11 +284,9 @@ function updateParticipantsClass(){
 }
 
 /* ======================
-   Local media (as before, robust front-camera heuristics)
+   Local media (same as original robust implementation)
    ====================== */
 async function ensureLocalStream(constraints = { audio:true, video:{ width:{ ideal:1280 }, height:{ ideal:720 } } }){
-  /* same robust implementation as earlier snapshot  omitted here for brevity but keep integrated */
-  // For completeness include full implementation:
   try {
     if (localState.localStream) {
       const vtracks = localState.localStream.getVideoTracks();
@@ -340,7 +377,7 @@ function setMicEnabled(enabled){ if(!localState.localStream) return; localState.
 function setCamEnabled(enabled){ if(!localState.localStream) return; localState.localStream.getVideoTracks().forEach(t=>t.enabled=!!enabled); if(el.toggleCamBtn){ el.toggleCamBtn.setAttribute('aria-pressed', String(!!enabled)); el.toggleCamBtn.textContent = enabled ? '🎥 Cam' : '🚫 Cam'; } const localTile = document.querySelector(`#tile-${localState.peerId}`); if(localTile) localTile.dataset._hasvideo = enabled ? 'true' : 'false'; }
 
 /* ======================
-   Firestore helpers (always used)
+   Firestore helpers
    ====================== */
 function roomDocRef(roomId){ return doc(db, 'rooms', roomId); }
 function peersCollectionRef(roomId){ return collection(db, 'rooms', roomId, 'peers'); }
@@ -357,16 +394,18 @@ async function touchPeerPresence(){ if(!localState.roomId || !localState.peerId)
 async function removePeerPresence(roomId, peerId){ try { await deleteDoc(doc(db, 'rooms', roomId, 'peers', peerId)); } catch(e){ console.warn('removePeerPresence failed', e); } }
 async function sendSignal(roomId, message){ try { const msg = { ...message, ts: serverTimestamp ? serverTimestamp() : Date.now() }; await addDoc(signalsCollectionRef(roomId), msg); } catch(e){ console.error('sendSignal failed', e); } }
 
-// sendChatMessage now returns the created doc id so caller can dedupe the local echo
+/* convenience sendChatMessage remains available but main submit handler uses pre-create + setDoc */
 async function sendChatMessage(roomId, name, text){ if(!text || !text.trim()) return null; try { const payload = { name, text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null }; const docRef = await addDoc(messagesCollectionRef(roomId), payload); return docRef && docRef.id ? docRef.id : null; } catch(e){ console.error('sendChatMessage failed', e); return null; } }
 
 /* ======================
-   WebRTC helpers: negotiation improvements
-   - polite peer strategy to avoid glare (deterministic: polite = localId < remoteId)
-   - candidate queue and drain
-   - safe rollback when receiving offer during have-local-offer
-   - dedupe signals by doc.id
-   ====================== */
+   WebRTC helpers, negotiation, etc.
+   (KEEP your existing working implementations here)
+   For brevity in this paste, include the same makeNewPeerConnection, safeSetRemoteDescription,
+   replaceOrAddTrack, createAndSendOffer, handleIncomingOffer/Answer/Ice, etc., from your working code.
+   (Important: do not remove the detailed logic you already used.)
+   =========================================================================== */
+
+/* ---------- For readability here we include the earlier provided implementations verbatim ---------- */
 
 /* helper queue */
 function enqueueCandidateForPeer(peerId, candPayload){ if(!localState.candidateQueue.has(peerId)) localState.candidateQueue.set(peerId, []); localState.candidateQueue.get(peerId).push(candPayload); }
@@ -385,11 +424,10 @@ async function drainCandidateQueue(peerId){
   } catch(e){ console.warn('drainCandidateQueue failed', e); }
 }
 
-/* safe setRemoteDescription with retry for InvalidStateError */
+/* safe setRemoteDescription */
 async function safeSetRemoteDescription(pc, desc, retries=6, waitMs=100) {
   for (let i=0;i<retries;i++){
     try { await pc.setRemoteDescription(desc); return; } catch (err) {
-      // If wrong state (race), wait and retry
       if (err && (err.name === 'InvalidStateError' || String(err).includes('Called in wrong state'))) {
         await new Promise(r=>setTimeout(r, waitMs));
         continue;
@@ -397,11 +435,10 @@ async function safeSetRemoteDescription(pc, desc, retries=6, waitMs=100) {
       throw err;
     }
   }
-  // final attempt
   await pc.setRemoteDescription(desc);
 }
 
-/* replace or add */
+/* replaceOrAddTrack */
 function replaceOrAddTrack(pc, track, stream){
   try {
     const kind = track.kind;
@@ -412,28 +449,44 @@ function replaceOrAddTrack(pc, track, stream){
   } catch(e){ try { return pc.addTrack(track, stream); } catch(er){ console.warn('replaceOrAddTrack failed', er); } }
 }
 
-/* datachannel handlers */
+/* datachannel handlers - updated to dedupe chat messages received over DC */
 function setupDataChannelHandlers(peerId, dc){
   if(!dc) return;
   dc.onopen = ()=> console.log('DC open', peerId);
   dc.onclose = ()=> console.log('DC close', peerId);
   dc.onerror = (e)=> console.warn('DC err', e);
   dc.onmessage = (evt)=> {
-    try { const data = JSON.parse(evt.data); if(data && data.type === 'chat') appendLogToChat({ name: data.name || 'Peer', text: data.text||'', ts: data.ts||Date.now(), self:false }); }
-    catch(e){ appendLogToChat({ name: peerId, text: evt.data, ts: Date.now(), self:false }); }
+    try {
+      const data = JSON.parse(evt.data);
+      if (data && data.type === 'chat') {
+        // build msg id from payload if provided, else stable id
+        const incomingTs = data.ts || Date.now();
+        const id = data.id ? String(data.id) : stableMsgId(data.from || peerId, data.name || 'Peer', data.text || '', incomingTs);
+        if (localState.processedMessageIds && localState.processedMessageIds.has(id)) {
+          console.debug('DC chat skipped (processed)', id);
+          return;
+        }
+        appendLogToChat({ id, name: data.name || 'Peer', text: data.text || '', ts: incomingTs, self: false });
+        localState.processedMessageIds.add(id);
+      } else {
+        // not a chat message -> append raw
+        appendLogToChat({ id: null, name: peerId, text: evt.data, ts: Date.now(), self:false });
+      }
+    } catch(e){
+      // non-json payload: show raw
+      appendLogToChat({ id: null, name: peerId, text: evt.data, ts: Date.now(), self:false });
+    }
   };
 }
 
-/* Create new PC with handlers. Also drain queue on signalingstatechange/remoteDesc */
+/* makeNewPeerConnection (same as earlier working logic) */
 function makeNewPeerConnection(peerId, isOfferer=false) {
   if (localState.pcMap.has(peerId)) return localState.pcMap.get(peerId);
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-  // pre-create remote stream placeholder
   const remoteStream = new MediaStream();
   localState.remoteStreams.set(peerId, remoteStream);
 
-  // add local tracks
   try { if (localState.localStream) localState.localStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.localStream); } catch(e){} }); } catch(e){}
   try { if (localState.screenStream) localState.screenStream.getTracks().forEach(track => { try { replaceOrAddTrack(pc, track, localState.screenStream); } catch(e){} }); } catch(e){}
 
@@ -469,18 +522,16 @@ function makeNewPeerConnection(peerId, isOfferer=false) {
   return pc;
 }
 
-/* Deterministic polite rule: the peer with the smaller id is "polite" (accepts incoming offers when glare) */
+/* polite rule */
 function isPoliteWith(remoteId){
   try { if (!localState.peerId || !remoteId) return true; return localState.peerId < remoteId; } catch(e){ return true; }
 }
 
-/* create offer (only if we should be the offerer for that peer)
-   Offerer rule: localPeerId < remotePeerId  => local should initiate */
+/* createAndSendOffer */
 async function createAndSendOffer(roomId, toPeerId){
   setStatus(`Creating offer for ${toPeerId}...`);
   const pc = makeNewPeerConnection(toPeerId, true);
   try {
-    // If signaling state indicates we already have a local offer in flight, skip creating another
     if (pc.signalingState && pc.signalingState.includes('have-local-offer')) { console.log('Offer already in-flight to', toPeerId); return; }
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -489,7 +540,7 @@ async function createAndSendOffer(roomId, toPeerId){
   } catch (e) { console.error('createAndSendOffer failed', e); setStatus('Offer failed'); }
 }
 
-/* Handle incoming offer with polite/glare handling + rollback if needed */
+/* handleIncomingOffer */
 async function handleIncomingOffer(roomId, { from, payload }){
   setStatus(`Received offer from ${from}`);
   const pc = makeNewPeerConnection(from, false);
@@ -497,14 +548,11 @@ async function handleIncomingOffer(roomId, { from, payload }){
   const desc = (typeof payload === 'string' || payload.sdp) ? { type: (payload.type || 'offer'), sdp: (payload.sdp || payload) } : payload;
 
   try {
-    // Glare handling: if we have a local offer (have-local-offer)
     if (pc.signalingState === 'have-local-offer') {
       if (!polite) {
-        // impolite: ignore incoming offer (drop it) to avoid connection race
         console.warn('Glare: impolite -> ignoring incoming offer from', from);
         return;
       }
-      // polite: perform rollback then setRemoteDescription
       try {
         await pc.setLocalDescription({ type:'rollback' });
       } catch (rbErr) { console.warn('rollback failed or unsupported', rbErr); }
@@ -521,7 +569,7 @@ async function handleIncomingOffer(roomId, { from, payload }){
   }
 }
 
-/* Handle incoming answer */
+/* handleIncomingAnswer */
 async function handleIncomingAnswer({ from, payload }){
   const pc = localState.pcMap.get(from);
   if (!pc) return console.warn('No PC for answer', from);
@@ -533,14 +581,13 @@ async function handleIncomingAnswer({ from, payload }){
   } catch (e) { console.error('handleIncomingAnswer failed', e); }
 }
 
-/* Handle incoming ICE candidate; create PC if missing; queue if remoteDescription not set yet */
+/* handleIncomingIce */
 async function handleIncomingIce({ from, payload }){
   try {
     const c = payload && payload.candidate ? payload.candidate : payload;
     if (!c) return;
     let pc = localState.pcMap.get(from);
-    if (!pc) pc = makeNewPeerConnection(from, false); // ensure PC exists
-    // if remoteDescription not set, queue
+    if (!pc) pc = makeNewPeerConnection(from, false);
     try {
       const rd = pc.remoteDescription;
       if (!rd || !rd.type) { enqueueCandidateForPeer(from, { candidate: c }); return; }
@@ -550,7 +597,8 @@ async function handleIncomingIce({ from, payload }){
 }
 
 /* ======================
-   Firestore listeners (dedupe signals using change.doc.id)
+   Firestore listeners (signals, peers, messages)
+   - Messages listener is idempotent and uses processedMessageIds
    ====================== */
 function startListeningToSignals(roomId){
   const q = query(signalsCollectionRef(roomId), orderBy('ts'));
@@ -558,7 +606,7 @@ function startListeningToSignals(roomId){
     snapshot.docChanges().forEach(async change => {
       if (change.type !== 'added') return;
       const docId = change.doc.id;
-      if (localState.processedSignalIds.has(docId)) return; // dedupe
+      if (localState.processedSignalIds.has(docId)) return;
       localState.processedSignalIds.add(docId);
 
       const docData = change.doc.data();
@@ -598,7 +646,6 @@ function startListeningToPeers(roomId){
         if (Date.now() - lastSeenMs > PRESENCE_TIMEOUT_MS) { console.log('Ignoring stale peer add', pid); return; }
         setStatus(`Peer joined: ${pid}`);
         addRemoteTile(pid, data.name || 'Participant');
-        // Deterministic offerer: only the "lower" id creates offer to avoid both creating an offer
         if (!localState.pcMap.has(pid) && localState.peerId && localState.peerId < pid) createAndSendOffer(roomId, pid).catch(e=>console.error(e));
       } else if (change.type === 'removed') {
         setStatus(`Peer left: ${pid}`);
@@ -626,18 +673,48 @@ function startListeningToPeers(roomId){
 }
 
 function startListeningToMessages(roomId){
+  if (!roomId) return;
+  if (localState._messagesListening) {
+    console.debug('startListeningToMessages: already listening');
+    return localState._messagesUnsub || (()=>{});
+  }
+  localState._messagesListening = true;
+
   const q = query(messagesCollectionRef(roomId), orderBy('ts'));
   const unsub = onSnapshot(q, (snapshot) => {
     snapshot.docChanges().forEach(change => {
       if (change.type !== 'added') return;
       const docId = change.doc.id;
-      // skip already processed messages (including local echoes)
-      if (localState.processedMessageIds.has(docId)) return;
+
+      if (localState.processedMessageIds && localState.processedMessageIds.has(docId)) {
+        // already handled
+        // console.debug('Messages listener skipped processed id', docId);
+        return;
+      }
+
+      // DOM-level guard
+      try {
+        if (el.chatBox && el.chatBox.querySelector(`[data-msg-id="${String(docId)}"]`)) {
+          localState.processedMessageIds.add(docId);
+          return;
+        }
+      } catch(e){ /* ignore selector errors */ }
+
       const msg = change.doc.data();
-      appendLogToChat({ id: docId, name: msg.name || 'Anon', text: msg.text || '', ts: (msg.ts && msg.ts.toMillis) ? msg.ts.toMillis() : (msg.ts || Date.now()), self: msg.from === localState.peerId });
+      const tsNum = (msg.ts && msg.ts.toMillis) ? msg.ts.toMillis() : (msg.ts || Date.now());
+      appendLogToChat({
+        id: docId,
+        name: msg.name || 'Anon',
+        text: msg.text || '',
+        ts: tsNum,
+        self: msg.from === localState.peerId
+      });
+      localState.processedMessageIds = localState.processedMessageIds || new Set();
       localState.processedMessageIds.add(docId);
     });
   }, err => console.error('Messages listener error', err));
+
+  localState._messagesUnsub = unsub;
   localState.unsubscribers.push(unsub);
   return unsub;
 }
@@ -678,8 +755,11 @@ async function joinRoom(roomIdInput){
   if (!roomId) { setStatus('Please enter a Room ID before joining'); return; }
   localState.roomId = roomId;
   localState.peerId = genId('p-');
-  // reset processedMessageIds for a fresh session
+
+  // reset message dedupe state for fresh join
   localState.processedMessageIds = new Set();
+  localState._messagesListening = false;
+  localState._messagesUnsub = null;
 
   const dn = el.displayNameInput && el.displayNameInput.value;
   if (dn && dn.trim()) localState.displayName = dn.trim();
@@ -701,7 +781,6 @@ async function joinRoom(roomIdInput){
       if (pid === localState.peerId) return;
       const lastSeenMs = (data.lastSeen && data.lastSeen.toMillis) ? data.lastSeen.toMillis() : (data.lastSeen || 0);
       if (Date.now() - lastSeenMs <= PRESENCE_TIMEOUT_MS) {
-        // only create offer if localId < remoteId (deterministic)
         if (!localState.pcMap.has(pid) && localState.peerId && localState.peerId < pid) createAndSendOffer(roomId, pid).catch(e=>console.error(e));
       }
     });
@@ -731,13 +810,20 @@ async function leaveRoom(){
     try { await removePeerPresence(roomId, localState.peerId); } catch(e){ console.warn('remove presence failed', e); }
     try { await cleanupRoomIfEmpty(roomId); } catch(e){ console.warn('cleanup attempt failed', e); }
   }
-  localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e){} }); localState.unsubscribers = [];
+
+  // Unsubscribe messages listener & reset dedupe
+  try {
+    if (localState._messagesUnsub) { try { localState._messagesUnsub(); } catch(e){} localState._messagesUnsub = null; }
+    localState._messagesListening = false;
+    localState.processedMessageIds = new Set();
+  } catch(e){}
+
+  localState.unsubscribers.forEach(unsub => { try { unsub(); } catch(e){} });
+  localState.unsubscribers = [];
   if (el.videos) { const tiles = Array.from(el.videos.querySelectorAll('.vid')); tiles.forEach(t=>t.remove()); }
   if (localState.localStream) { localState.localStream.getTracks().forEach(t=>t.stop()); localState.localStream = null; }
   if (localState.screenStream) { localState.screenStream.getTracks().forEach(t=>t.stop()); localState.screenStream = null; }
   localState.roomId = null; localState.peerId = null; localState.remoteStreams.clear(); localState.peerMeta.clear(); localState._joined=false;
-  // clear processed message ids so next join is fresh
-  localState.processedMessageIds = new Set();
   if (el.leaveRoomBtn) el.leaveRoomBtn.disabled = true; if (el.createRoomBtn) el.createRoomBtn.disabled = false;
   setStatus('Left room');
   if (localState._autoJoinedFromHash && el.roomControlsSection) {
@@ -758,6 +844,8 @@ async function tryCleanupOnUnload(){
   } catch(err){ console.warn('tryCleanupOnUnload error', err); }
   if (localState.localStream) localState.localStream.getTracks().forEach(t=>t.stop());
   if (localState.screenStream) localState.screenStream.getTracks().forEach(t=>t.stop());
+  // reset messages listener flags
+  try { if (localState._messagesUnsub) { localState._messagesUnsub(); localState._messagesUnsub = null; } localState._messagesListening = false; } catch(e){}
 }
 window.addEventListener('beforeunload', ()=> tryCleanupOnUnload());
 window.addEventListener('pagehide', (ev)=> { if (!ev.persisted) tryCleanupOnUnload(); });
@@ -766,7 +854,7 @@ window.addEventListener('pagehide', (ev)=> { if (!ev.persisted) tryCleanupOnUnlo
 function startPresenceHeartbeat(){ if(localState._presenceHeartbeatInterval) return; touchPeerPresence().catch(()=>{}); localState._presenceHeartbeatInterval = setInterval(()=>{ touchPeerPresence().catch(()=>{}); }, PRESENCE_HEARTBEAT_MS); }
 function stopPresenceHeartbeat(){ if(localState._presenceHeartbeatInterval){ clearInterval(localState._presenceHeartbeatInterval); localState._presenceHeartbeatInterval=null; } }
 
-/* screen share (unchanged logic) */
+/* screen share (unchanged) */
 async function startScreenShare(){
   if (!navigator.mediaDevices.getDisplayMedia) { setStatus('Screen share not supported'); return; }
   try {
@@ -792,22 +880,37 @@ async function startScreenShare(){
   } catch(e){ console.error('startScreenShare failed', e); setStatus('Failed to share screen'); }
 }
 
-/* chat wiring */
+/* chat wiring - PRE-CREATE docRef id, mark processed BEFORE setDoc, DOM-level dedupe */
 if (el.chatForm) {
   el.chatForm.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const text = (el.chatInput.value || '').trim();
     if (!text) return;
-    if (!localState.roomId) { setStatus('Not in a room  chat not sent'); return; }
+    if (!localState.roomId) { setStatus('Not in a room — chat not sent'); return; }
 
-    // send and obtain docId for dedup
-    const docId = await sendChatMessage(localState.roomId, localState.displayName || 'Guest', text);
-    if (docId) {
-      appendLogToChat({ id: docId, name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
+    try {
+      const collRef = messagesCollectionRef(localState.roomId);
+      const newDocRef = doc(collRef); // client-side docRef with id
+      const docId = newDocRef.id;
+
+      // mark processed BEFORE writing
       localState.processedMessageIds = localState.processedMessageIds || new Set();
       localState.processedMessageIds.add(docId);
-    } else {
-      // fallback local echo if write failed
+
+      // local echo (tagged with docId)
+      appendLogToChat({ id: docId, name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
+
+      // write to Firestore
+      const payload = { name: localState.displayName || 'Me', text, ts: serverTimestamp ? serverTimestamp() : Date.now(), from: localState.peerId || null };
+      await setDoc(newDocRef, payload);
+
+      // Optionally, also broadcast via data channels if you want fast P2P chat echo (not required)
+      // for (const [pid, dc] of localState.dcMap.entries()) {
+      //   try { if (dc && dc.readyState === 'open') dc.send(JSON.stringify({ type:'chat', id: docId, name: localState.displayName, text, ts: Date.now(), from: localState.peerId })); } catch(e){}
+      // }
+
+    } catch (e) {
+      console.error('Chat send failed', e);
       appendLogToChat({ name: localState.displayName || 'Me', text, ts: Date.now(), self: true });
     }
 
@@ -816,7 +919,7 @@ if (el.chatForm) {
   if (el.sendChatBtn) el.sendChatBtn.addEventListener('click', () => el.chatForm.dispatchEvent(new Event('submit', { cancelable: true })));
 }
 
-/* controls wiring */
+/* controls wiring (unchanged) */
 if (el.createRoomBtn) el.createRoomBtn.addEventListener('click', () => joinRoom(el.roomIdInput.value.trim()).catch(console.error));
 if (el.leaveRoomBtn) el.leaveRoomBtn.addEventListener('click', () => leaveRoom().catch(console.error));
 if (el.toggleMicBtn) el.toggleMicBtn.addEventListener('click', () => { if(!localState.localStream) return; const enabled = localState.localStream.getAudioTracks().some(t=>t.enabled); setMicEnabled(!enabled); });
@@ -826,14 +929,14 @@ if (el.displayNameInput) el.displayNameInput.addEventListener('change', async ()
   const nm = el.displayNameInput.value.trim() || 'Guest'; localState.displayName = nm; if (localState.roomId && localState.peerId) try { await writePeerPresence(localState.roomId, localState.peerId, { name: nm }); } catch(e){ console.warn(e); }
 });
 
-/* initial preview (non-blocking) */
+/* initial preview */
 (async function tryInitPreview(){ try { if (!localState.localStream) { await ensureLocalStream({ audio:true, video:{ width:640, height:360 } }); setMicEnabled(true); setCamEnabled(true); } } catch(e){ console.debug('Initial preview unavailable', e); } })();
 
-/* layout helpers (fit + grid) */
+/* layout helpers (unchanged) */
 function fitVideosToViewport(){ try{ const header=document.querySelector('.site-header'); const roomControls=document.querySelector('#room-controls'); const controls=document.querySelector('#video-section .controls')||document.querySelector('.controls'); const footer=document.querySelector('.site-footer'); const top = header?header.getBoundingClientRect().height:0; const roomH = roomControls?roomControls.getBoundingClientRect().height:0; const controlsH=controls?controls.getBoundingClientRect().height:0; const footerH=footer?footer.getBoundingClientRect().height:0; const extras=32; const vh=window.innerHeight; const available = Math.max(160, Math.floor(vh - (top + roomH + controlsH + footerH + extras))); document.documentElement.style.setProperty('--videos-max-h', `${available}px`); const videosEl = document.querySelector('.videos'); if (videosEl) videosEl.style.overflowY = (available < 260) ? 'auto' : 'hidden'; } catch(e){ console.warn('fitVideosToViewport error', e); } }
 function layoutVideoGrid(){ try { const videosEl=document.querySelector('.videos'); if(!videosEl) return; const tiles=Array.from(videosEl.querySelectorAll('.vid')); const N=Math.max(tiles.length,1); let cssMaxH=getComputedStyle(document.documentElement).getPropertyValue('--videos-max-h')||''; cssMaxH=cssMaxH.trim().replace('px',''); let availableHeight=parseInt(cssMaxH,10); if(!availableHeight||Number.isNaN(availableHeight)){ const header=document.querySelector('.site-header'); const roomControls=document.querySelector('#room-controls'); const controls=document.querySelector('#video-section .controls')||document.querySelector('.controls'); const footer=document.querySelector('.site-footer'); const top=header?header.getBoundingClientRect().height:0; const roomH=roomControls?roomControls.getBoundingClientRect().height:0; const controlsH=controls?controls.getBoundingClientRect().height:0; const footerH=footer?footer.getBoundingClientRect().height:0; const extras=32; availableHeight=Math.max(160,Math.floor(window.innerHeight - (top + roomH + controlsH + footerH + extras))); } const containerRect=videosEl.getBoundingClientRect(); let containerWidth=(containerRect && containerRect.width && containerRect.width>0)?containerRect.width:(window.innerWidth - (document.querySelector('.sidebar')?document.querySelector('.sidebar').getBoundingClientRect().width:0)-40); if(!containerWidth || Number.isNaN(containerWidth) || containerWidth<=0) containerWidth = Math.max(window.innerWidth * 0.6, 320); const aspectRatio = 16/9; const gap = parseFloat(getComputedStyle(videosEl).gap || 12) || 12; const minTileH = 100; const maxCols = Math.min(N, Math.max(1, Math.floor(containerWidth/160))); let best = { cols:1, rows:N, tileWidth:containerWidth, tileHeight:Math.max(minTileH, Math.floor(containerWidth/aspectRatio)), totalHeight: Math.ceil(N) * Math.floor(containerWidth/aspectRatio), fits:false, overflow:Infinity }; for(let cols=1; cols<=maxCols; cols++){ const tileW=(containerWidth - (cols -1)*gap)/cols; const tileH = tileW / aspectRatio; const rows = Math.ceil(N/cols); const totalH = rows * tileH + (rows -1)*gap; const overflow = Math.max(0, totalH - availableHeight); const fits = totalH <= availableHeight; if(fits){ if(!best.fits || tileH > best.tileHeight) best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits, overflow }; } else { if(!best.fits){ if(overflow < best.overflow || (Math.abs(overflow - best.overflow) < 1 && tileH > best.tileHeight)) best = { cols, rows, tileWidth:tileW, tileHeight:tileH, totalHeight, fits:false, overflow }; } } } const tileHpx = Math.max(minTileH, Math.floor(best.tileHeight || 180)); const colsToUse = best.cols || 1; const rowsToUse = best.rows || Math.ceil(N/colsToUse); videosEl.style.gridTemplateColumns = `repeat(${colsToUse}, 1fr)`; videosEl.style.setProperty('--tile-height', `${tileHpx}px`); videosEl.style.setProperty('--videos-max-h', `${availableHeight}px`); tiles.forEach(t=>{ try{ t.style.height = `${tileHpx}px`; } catch(e){} }); videosEl.style.overflowY = best.fits ? 'hidden' : 'auto'; const statusEl = document.querySelector('#status'); if(statusEl) statusEl.textContent = `Tiles: ${N} • grid ${colsToUse}×${rowsToUse} • ${best.fits ? 'fit' : 'scroll'}`; } catch(e){ console.warn('layoutVideoGrid error', e); } }
 
-/* visibility rules & polling */
+/* visibility rules & polling (unchanged) */
 function applyVisibilityRules(maxVisible = MAX_VISIBLE_TILES){ try { const videosEl=document.querySelector('.videos'); if(!videosEl) return; const tiles=Array.from(videosEl.querySelectorAll('.vid')); const total=tiles.length; if(total <= maxVisible){ tiles.forEach(t=>{ t.classList.remove('hidden-by-limit'); t.style.display=''; t.setAttribute('aria-hidden','false'); }); setStatus(`${total} participants`); layoutVideoGrid(); return; } const infos = tiles.map(t=>{ const peer = t.dataset.peer || t.id || ''; const isLocal = t.classList.contains('local') || peer === localState.peerId; const hasVideo = (t.dataset._hasvideo === 'true'); const meta = localState.peerMeta.get(peer) || {}; const createdAtMs = meta.createdAtMs || 0; return { tileEl:t, peer, isLocal, hasVideo, createdAtMs }; }); infos.sort((a,b)=>{ if(a.isLocal && !b.isLocal) return -1; if(!a.isLocal && b.isLocal) return 1; if(a.hasVideo && !b.hasVideo) return -1; if(!a.hasVideo && b.hasVideo) return 1; return (a.createdAtMs || 0) - (b.createdAtMs || 0); }); const visible = infos.slice(0, maxVisible); const visiblePeers = new Set(visible.map(i=>i.peer)); infos.forEach(info=>{ const tile=info.tileEl; if(visiblePeers.has(info.peer)){ tile.classList.remove('hidden-by-limit'); tile.style.display=''; tile.setAttribute('aria-hidden','false'); } else { tile.classList.add('hidden-by-limit'); tile.style.display='none'; tile.setAttribute('aria-hidden','true'); } }); const hiddenCount = total - visiblePeers.size; setStatus(`${total} participants • ${hiddenCount} hidden`); layoutVideoGrid(); } catch(e){ console.warn('applyVisibilityRules err', e); } }
 function detectVideoStateAndApply(maxVisible = MAX_VISIBLE_TILES){ try { const videosEl=document.querySelector('.videos'); if(!videosEl) return; const tiles=Array.from(videosEl.querySelectorAll('.vid')); let changed=false; for(const t of tiles){ const videoEl = t.querySelector('video'); let hasVideo=false; try { if(videoEl && videoEl.srcObject){ const vtracks = (videoEl.srcObject.getVideoTracks && videoEl.srcObject.getVideoTracks()) || []; hasVideo = vtracks.some(tr=>tr && tr.enabled !== false && (tr.readyState !== 'ended')); } } catch(e){ hasVideo=false; } const prev = t.dataset._hasvideo === 'true'; if (prev !== hasVideo) { t.dataset._hasvideo = hasVideo ? 'true' : 'false'; changed = true; } } if (changed) applyVisibilityRules(maxVisible); } catch(e){ console.warn('detectVideoStateAndApply err', e); } }
 function startVideoStatePolling(){ if (localState._videoDetectInterval) return; localState._videoDetectInterval = setInterval(()=> detectVideoStateAndApply(MAX_VISIBLE_TILES), VIDEO_POLL_INTERVAL_MS); }
@@ -1065,5 +1168,5 @@ window._pakelmeet = { localState, joinRoom, leaveRoom, setStatus, sendChatMessag
   } catch (e) { /* ignore */ }
 
 })();
-
 /* End of file */
+  
